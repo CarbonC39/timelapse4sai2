@@ -1,3 +1,4 @@
+mod export;
 mod image;
 mod process;
 mod recorder;
@@ -14,7 +15,7 @@ fn run() -> Result<(), String> {
         println!("timelapse4sai2 [--pid PID] record INDEX SESSION_DIR [OPTIONS]");
         println!("timelapse4sai2 verify SESSION_DIR");
         println!("timelapse4sai2 verify SESSION_DIR --dump-final FILE.png");
-        println!("timelapse4sai2 export SESSION_DIR OUTPUT.mp4 [--fps N] [--size N]");
+        println!("{}", export::HELP);
         let d = recorder::Config::default();
         println!(
             "  --idle-delay-ms {}\n  --min-capture-gap-ms {}\n  --max-active-gap-ms {}\n  --zstd-level {}\n  --checkpoint-every-events {}\n  --checkpoint-changed-ratio {}\n  --no-input-watch",
@@ -36,38 +37,16 @@ fn run() -> Result<(), String> {
         }
         if args.len() == 4 && args[2] == "--dump-final" {
             recorder::storage::verify(Path::new(&args[1]))?;
-            return recorder::storage::dump_final(Path::new(&args[1]), Path::new(&args[3]));
+            return export::dump_final(Path::new(&args[1]), Path::new(&args[3]));
         }
         return Err("usage: timelapse4sai2 verify SESSION_DIR [--dump-final FILE.png]".into());
     }
     if args.first().map(String::as_str) == Some("export") {
         if args.len() < 3 {
-            return Err(
-                "usage: timelapse4sai2 export SESSION_DIR OUTPUT.mp4 [--fps N] [--size N]".into(),
-            );
+            return Err(export::HELP.into());
         }
-        let (mut fps, mut size) = (2u32, 1280u32);
-        let mut i = 3;
-        while i < args.len() {
-            let value = args
-                .get(i + 1)
-                .ok_or_else(|| format!("missing value for {}", args[i]))?;
-            let parsed = value
-                .parse::<u32>()
-                .map_err(|_| format!("invalid value for {}", args[i]))?;
-            match args[i].as_str() {
-                "--fps" => fps = parsed,
-                "--size" => size = parsed,
-                _ => return Err(format!("unknown export option {}", args[i])),
-            }
-            i += 2;
-        }
-        return recorder::storage::export_video(
-            Path::new(&args[1]),
-            Path::new(&args[2]),
-            fps,
-            size,
-        );
+        let options = export::Options::parse(&args[3..])?;
+        return export::run(Path::new(&args[1]), Path::new(&args[2]), options);
     }
     let mut pid = None;
     if args.first().is_some_and(|a| a == "--pid") {

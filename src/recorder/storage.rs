@@ -9,7 +9,6 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     os::fd::AsRawFd,
     path::Path,
-    process::{Command, Stdio},
 };
 use xxhash_rust::xxh3::xxh3_128;
 const MAX_RECORD: usize = 64 * 1024 * 1024;
@@ -445,214 +444,86 @@ pub fn verify(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Reconstruct the last persisted canvas and write it as an RGB PNG.
-pub fn dump_final(dir: &Path, output: &Path) -> Result<(), String> {
-    let manifest: Manifest =
-        serde_json::from_slice(&fs::read(dir.join("manifest.json")).map_err(err)?).map_err(err)?;
-    let store = Store::open(dir, manifest, Config::default())?;
-    let mut blobs = File::open(dir.join("blobs.bin")).map_err(err)?;
-    let (width, height, rgb) = render_rgb(&store.state, &store.index, &mut blobs)?;
-    crate::image::write_png(output, width, height, &rgb)?;
-    println!(
-        "Wrote final {}x{} canvas to {}",
-        width,
-        height,
-        output.display()
-    );
-    Ok(())
+/// Read-only access to a stopped session. Incomplete tails are ignored, never truncated.
+pub struct Session {
+    _lock: File,
+    pub manifest: Manifest,
+    blobs: File,
+    timeline: File,
+    index: HashMap<BlobId, u64>,
 }
-
-fn render_rgb(
-    state: &State,
-    index: &HashMap<BlobId, u64>,
-    blobs: &mut File,
-) -> Result<(u32, u32, Vec<u8>), String> {
-    let (width, height) = (state.width, state.height);
-    if width == 0 || height == 0 {
-        return Err("session contains no captured canvas".into());
-    }
-    let rgb_len = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|n| n.checked_mul(3))
-        .filter(|&n| n <= crate::sai::preview_2026_07_02b::MAX_RGB_BYTES)
-        .ok_or("canvas exceeds 1 GiB RGB limit")?;
-    let nx = width.div_ceil(256);
-    let ny = height.div_ceil(256);
-    let expected_tiles = nx as usize * ny as usize;
-    if state.tiles.len() != expected_tiles {
-        return Err("canvas tile grid is incomplete".into());
-    }
-    let mut rgb = Vec::new();
-    rgb.try_reserve_exact(rgb_len).map_err(err)?;
-    rgb.resize(rgb_len, 0);
-    for y in 0..ny {
-        for x in 0..nx {
-            let id = *state
-                .tiles
-                .get(&(x, y))
-                .ok_or_else(|| format!("missing tile at ({x},{y})"))?;
-            let offset = *index
-                .get(&id)
-                .ok_or_else(|| format!("missing referenced blob {id:032x}"))?;
-            blobs.seek(SeekFrom::Start(offset)).map_err(err)?;
-            let data = next(blobs)?.ok_or_else(|| format!("incomplete blob record {id:032x}"))?;
+impl Session {
+    pub fn open(dir: &Path) -> Result<Self, String> {
+        let lock = File::open(dir.join("session.lock")).map_err(err)?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+            return Err("session is open by a recorder; stop recording before exporting".into());
+        }
+        let manifest: Manifest =
+            serde_json::from_slice(&fs::read(dir.join("manifest.json")).map_err(err)?)
+                .map_err(err)?;
+        if manifest.format_version != 1
+            || manifest.tile_size != 256
+            || !manifest.channel_order.starts_with("BGRX")
+        {
+            return Err("unsupported session format, tile size or channel order".into());
+        }
+        let mut blobs = File::open(dir.join("blobs.bin")).map_err(err)?;
+        let mut index = HashMap::new();
+        loop {
+            let offset = blobs.stream_position().map_err(err)?;
+            let Some(data) = next(&mut blobs)? else { break };
             let blob: Blob = bincode::deserialize(&data).map_err(err)?;
-            if blob.id != id {
-                return Err(format!("blob index mismatch for {id:032x}"));
-            }
-            let tile = zstd::bulk::decompress(&blob.compressed, TILE_BYTES).map_err(err)?;
-            verify_identity(id, &tile)?;
-            let valid_w = (width - x * 256).min(256) as usize;
-            let valid_h = (height - y * 256).min(256) as usize;
-            for dy in 0..valid_h {
-                for dx in 0..valid_w {
-                    let src = (dy * 256 + dx) * 4;
-                    let dst =
-                        (((y as usize * 256 + dy) * width as usize) + x as usize * 256 + dx) * 3;
-                    rgb[dst..dst + 3].copy_from_slice(&[tile[src + 2], tile[src + 1], tile[src]]);
+            let raw = zstd::bulk::decompress(&blob.compressed, TILE_BYTES).map_err(err)?;
+            verify_identity(blob.id, &raw)?;
+            index.insert(blob.id, offset);
+        }
+        Ok(Self {
+            _lock: lock,
+            manifest,
+            blobs,
+            timeline: File::open(dir.join("timeline.bin")).map_err(err)?,
+            index,
+        })
+    }
+    pub fn position(&mut self) -> Result<u64, String> {
+        self.timeline.stream_position().map_err(err)
+    }
+    pub fn seek(&mut self, offset: u64) -> Result<(), String> {
+        self.timeline.seek(SeekFrom::Start(offset)).map_err(err)?;
+        Ok(())
+    }
+    pub fn next_batch(&mut self) -> Result<Option<Vec<Event>>, String> {
+        let Some(data) = next(&mut self.timeline)? else {
+            return Ok(None);
+        };
+        let events: Vec<Event> = bincode::deserialize(&data).map_err(err)?;
+        for event in &events {
+            let tiles = match event {
+                Event::Frame { changed_tiles, .. } => changed_tiles,
+                Event::Checkpoint { tiles, .. } => tiles,
+                _ => continue,
+            };
+            for (_, id) in tiles {
+                if !self.index.contains_key(id) {
+                    return Err(format!("missing referenced blob {id:032x}"));
                 }
             }
         }
+        Ok(Some(events))
     }
-    Ok((width, height, rgb))
-}
-
-fn square_frame(rgb: &[u8], width: u32, height: u32, size: u32) -> Result<Vec<u8>, String> {
-    let len = (size as usize)
-        .checked_mul(size as usize)
-        .and_then(|n| n.checked_mul(3))
-        .ok_or("video frame too large")?;
-    let mut frame = Vec::new();
-    frame.try_reserve_exact(len).map_err(err)?;
-    frame.resize(len, 128);
-    let (fit_w, fit_h) = if width >= height {
-        (
-            size,
-            ((height as u64 * size as u64) / width as u64).max(1) as u32,
-        )
-    } else {
-        (
-            ((width as u64 * size as u64) / height as u64).max(1) as u32,
-            size,
-        )
-    };
-    let left = (size - fit_w) / 2;
-    let top = (size - fit_h) / 2;
-    for y in 0..fit_h {
-        let sy = (y as u64 * height as u64 / fit_h as u64) as usize;
-        for x in 0..fit_w {
-            let sx = (x as u64 * width as u64 / fit_w as u64) as usize;
-            let src = (sy * width as usize + sx) * 3;
-            let dst = (((top + y) as usize * size as usize) + (left + x) as usize) * 3;
-            frame[dst..dst + 3].copy_from_slice(&rgb[src..src + 3]);
+    pub fn load_blob(&mut self, id: BlobId) -> Result<Vec<u8>, String> {
+        let offset = *self
+            .index
+            .get(&id)
+            .ok_or_else(|| format!("missing referenced blob {id:032x}"))?;
+        self.blobs.seek(SeekFrom::Start(offset)).map_err(err)?;
+        let data = next(&mut self.blobs)?.ok_or("incomplete blob record")?;
+        let blob: Blob = bincode::deserialize(&data).map_err(err)?;
+        if blob.id != id {
+            return Err("blob index mismatch".into());
         }
-    }
-    Ok(frame)
-}
-
-/// Export one fixed-rate preview state for each timeline batch containing a
-/// persisted frame or canvas resize.
-pub fn export_video(dir: &Path, output: &Path, fps: u32, size: u32) -> Result<(), String> {
-    if !(1..=60).contains(&fps) {
-        return Err("video fps must be 1..60".into());
-    }
-    if !(64..=4096).contains(&size) || size % 2 != 0 {
-        return Err("video size must be even and 64..=4096".into());
-    }
-    if output.exists() {
-        return Err(format!("output already exists: {}", output.display()));
-    }
-    let manifest: Manifest =
-        serde_json::from_slice(&fs::read(dir.join("manifest.json")).map_err(err)?).map_err(err)?;
-    let mut store = Store::open(dir, manifest, Config::default())?;
-    store.state = State::default();
-    store.since_checkpoint = 0;
-    let mut timeline = File::open(dir.join("timeline.bin")).map_err(err)?;
-    let mut blobs = File::open(dir.join("blobs.bin")).map_err(err)?;
-    let mut child = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-f",
-            "rawvideo",
-            "-pixel_format",
-            "rgb24",
-            "-video_size",
-            &format!("{size}x{size}"),
-            "-framerate",
-            &fps.to_string(),
-            "-i",
-            "pipe:0",
-            "-an",
-            "-vf",
-            "fps=30",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "fast",
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
-            "-threads",
-            "2",
-            "-movflags",
-            "+faststart",
-            "-n",
-        ])
-        .arg(output)
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot start ffmpeg: {e}"))?;
-    let mut input = child.stdin.take().ok_or("ffmpeg stdin unavailable")?;
-    let result = (|| {
-        let mut states = 0u64;
-        while let Some(data) = next(&mut timeline)? {
-            let events: Vec<Event> = bincode::deserialize(&data).map_err(err)?;
-            let has_state = events
-                .iter()
-                .any(|event| matches!(event, Event::Frame { .. } | Event::CanvasResize { .. }));
-            for event in events {
-                if matches!(event, Event::Transform { .. }) {
-                    return Err("Transform event export is not supported".into());
-                }
-                store.apply(&event)?;
-            }
-            if has_state {
-                let (width, height, rgb) = render_rgb(&store.state, &store.index, &mut blobs)?;
-                let frame = square_frame(&rgb, width, height, size)?;
-                input
-                    .write_all(&frame)
-                    .map_err(|e| format!("cannot write video frame: {e}"))?;
-                states += 1;
-            }
-        }
-        if states == 0 {
-            return Err("session has no persisted frame states to export".into());
-        }
-        Ok(states)
-    })();
-    drop(input);
-    match result {
-        Ok(states) => {
-            let status = child.wait().map_err(err)?;
-            if !status.success() {
-                let _ = fs::remove_file(output);
-                return Err(format!("ffmpeg exited with {status}"));
-            }
-            println!(
-                "Exported {states} states at {fps} fps to {}",
-                output.display()
-            );
-            Ok(())
-        }
-        Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = fs::remove_file(output);
-            Err(e)
-        }
+        let raw = zstd::bulk::decompress(&blob.compressed, TILE_BYTES).map_err(err)?;
+        verify_identity(id, &raw)?;
+        Ok(raw)
     }
 }

@@ -102,18 +102,34 @@ blob 索引内存随 unique blobs 增长；存储慢会拉长候选间隔，不�
 `--dump-final` 离线合成最终 RGB PNG，不影响 recorder 热路径；已有 PNG 不覆盖。
 默认录制产物目录 `/recordings/` 已加入 gitignore。
 
-## 简单视频预览
+## 离线视频导出
 
-需要 PATH 中有支持 libx264 的 `ffmpeg`：
+停止录制后即可导出，无需 SAI 运行；PATH 中需有支持 libx264 或 h264_nvenc 的 `ffmpeg`。
 
 ```sh
-./target/release/timelapse4sai2 export ./recordings/live-test ./recordings/preview.mp4
-# 放慢，每个 logical state 显示 1 秒：
-./target/release/timelapse4sai2 export ./recordings/live-test ./recordings/slow.mp4 --fps 1 --size 1280
+./target/release/timelapse4sai2 export ./recordings/live-test artwork.mp4
+./target/release/timelapse4sai2 export ./recordings/live-test artwork-high.mp4 \
+  --fps 60 --speed 2 --encoder nvenc --quality high --size 2160 \
+  --hold-end 4 --preview-end 1
 ```
 
-默认每秒 2 个状态，包含 Stable、Provisional 和 resize 状态，忽略 wall-clock 间隔。
-checkpoint 不额外产生视频帧。画面等比缩放并居中放入 1280×1280 灰底，最近邻缩放用于粗略检查；
-输出为 H.264 MP4 / yuv420p / 30fps（重复显示状态以保持时长）。
-`--fps` 范围 1..60，`--size` 为 64..4096 的偶数；视频输出不覆盖已有文件。
-仅离线导出时合成 RGB，按顺序处理当前状态，不缓存历史帧。尚不支持结构 Transform 事件导出。
+默认 `30fps / 1x / auto encoder / balanced quality / auto size / max canvas`，
+包含 Stable 和 Provisional 状态，末尾定格 3 秒。`--help` 列出全部参数。
+Session 是有序视觉状态而非实时录屏，忽略 timestamp 和 idle 时间：
+`1x` 每秒推进 30 个状态，`--speed` 调节绘画播放倍率，`--fps` 只调节输出帧率。
+加速均匀跳过状态，减速重复状态；`--skip-provisional` 仅选 Stable，
+但重建仍应用所有增量。`--preview-end` 在开头展示最终成品，`--hold-end` 在末尾定格；
+均以秒指定，四舍五入到最近输出帧，0 关闭。定格使用最终持久状态，包括被过滤的末尾状态。
+
+`--canvas-mode max` 先以历史最大宽高统一逻辑画布，小画布居中补灰边，原图不缩放；
+resize origin 未知时居中放置。`initial` 固定初始尺寸，后续较大画布居中裁剪。
+再由 `--size 1080|1440|2160` 将**最长边**等比缩放到指定像素数；
+`auto` 保留自然尺寸、不主动放大，仅在超出编码器保守上限时缩小（NVENC 4096、x264 8192）。
+最终奇数宽高在右/下补 1px 灰边，输出 H.264 MP4 / yuv420p。
+
+`--encoder auto` 实际试编码探测 NVENC 初始化能力，不可用时提示并回退 x264；
+显式 `nvenc` 失败会报错。`--quality draft|balanced|high|archival` 从快速预览到近无损编码，
+默认 balanced；archival 仍经过 yuv420p 色度采样，不替代无损 session。
+仅支持 `.mp4`，已有输出默认拒绝覆盖；`--overwrite` 在编码成功后替换。
+导出以只读方式校验 session，拒绝活跃 recorder，不改写不完整尾部；
+顺序重放仅更新变化 tile，通过 raw RGB 管道编码，不生成中间 PNG 或缓存完整视频。
