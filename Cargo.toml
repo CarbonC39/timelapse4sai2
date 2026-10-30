@@ -1,5 +1,5 @@
 [package]
-name = "sai-memory-probe"
+name = "timelapse4sai2"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,3 +7,8 @@ edition = "2024"
 libc = "0.2"
 md5 = "0.7"
 png = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1.3"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zstd = "0.13"
