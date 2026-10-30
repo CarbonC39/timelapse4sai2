@@ -210,22 +210,12 @@ static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn stop(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
-pub fn record<M: ProcessMemory>(
-    reader: &Reader<M>,
-    canvas: &Canvas,
-    dir: &Path,
-    hash: &str,
-    config: Config,
-) -> Result<(), String> {
-    let mut input = if config.no_input_watch {
-        None
-    } else {
-        Some(input::InputWatcher::new()?)
-    };
-    let manifest = Manifest {
+fn recording_manifest<M: ProcessMemory>(reader: &Reader<M>, canvas: &Canvas) -> Manifest {
+    Manifest {
         format_version: 1,
-        sai_profile: "SAI2 x64 2026-07-02b Technical Preview".into(),
-        source_executable_md5: hash.into(),
+        sai_profile: reader.profile.display_name.into(),
+        sai_generation: Some(reader.profile.generation.name().into()),
+        source_executable_md5: reader.profile.executable_hash.into(),
         initial_width: canvas.width,
         initial_height: canvas.height,
         canvas_name: canvas.name.clone(),
@@ -236,11 +226,24 @@ pub fn record<M: ProcessMemory>(
         recorder_version: env!("CARGO_PKG_VERSION").into(),
         identity_limit: concat!(
             "Name/path are descriptive, not globally stable document IDs. ",
-            "Live selection uses address + SAI id; reopening requires explicit ",
+            "Live selection uses address + SAI id when available; reopening requires explicit ",
             "canvas selection; same-name replacement cannot be proven identical."
         )
         .into(),
+    }
+}
+pub fn record<M: ProcessMemory>(
+    reader: &Reader<M>,
+    canvas: &Canvas,
+    dir: &Path,
+    config: Config,
+) -> Result<(), String> {
+    let mut input = if config.no_input_watch {
+        None
+    } else {
+        Some(input::InputWatcher::new()?)
     };
+    let manifest = recording_manifest(reader, canvas);
     let store = Store::open(dir, manifest, config.clone())?;
     STOP.store(false, Ordering::Relaxed);
     unsafe {

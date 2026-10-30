@@ -1,30 +1,19 @@
-use super::{canvas::Canvas, preview_2026_07_02b::*};
+use super::{
+    canvas::Canvas,
+    profile::{RootLocator, SaiProfile},
+};
+const MAX_DIMENSION: u32 = 100_000;
+const MAX_RGB_BYTES: usize = 1024 * 1024 * 1024;
 use crate::process::ProcessMemory;
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, Copy)]
-pub struct Layout {
-    pub session_offset: usize,
-    pub canvas_id_offset: usize,
-    pub canvas_tile_map_slot_offset: usize,
-    pub canvas_width_offset: usize,
-    pub canvas_height_offset: usize,
-    pub canvas_name_offset: usize,
-    pub canvas_short_path_offset: usize,
-    pub map_tree_offset: usize,
-    pub map_width_offset: usize,
-    pub map_height_offset: usize,
-    pub map_nx_offset: usize,
-    pub map_ny_offset: usize,
-    pub pointer_stride: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TileMap {
     pub nx: u32,
     pub ny: u32,
     pub(crate) map: usize,
     pub(crate) slot: usize,
+    level0_address: usize,
     pub(crate) tree: usize,
     pub(crate) metadata: [u8; 32],
 }
@@ -32,7 +21,7 @@ pub struct TileMap {
 pub struct Reader<'a, M: ProcessMemory> {
     pub memory: &'a M,
     pub base: usize,
-    pub profile: &'static Layout,
+    pub profile: &'static SaiProfile,
 }
 impl<M: ProcessMemory> Reader<'_, M> {
     fn bytes<const N: usize>(&self, address: usize) -> Result<[u8; N], String> {
@@ -64,7 +53,8 @@ impl<M: ProcessMemory> Reader<'_, M> {
         Ok(u32::from_le_bytes(self.bytes(address)?))
     }
     fn string(&self, address: usize) -> Result<String, String> {
-        let bytes = self.bytes::<512>(address)?;
+        let mut bytes = vec![0; self.profile.layout.string_bytes];
+        self.memory.read_into(address, &mut bytes)?;
         let units: Vec<u16> = bytes
             .chunks_exact(2)
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
@@ -76,9 +66,9 @@ impl<M: ProcessMemory> Reader<'_, M> {
         String::from_utf16(&units[..end]).map_err(|e| format!("invalid UTF-16: {e}"))
     }
     pub fn read_canvas(&self, p: usize) -> Result<Canvas, String> {
-        let l = self.profile;
-        let width = self.u32(Self::at(p, l.canvas_width_offset)?)?;
-        let height = self.u32(Self::at(p, l.canvas_height_offset)?)?;
+        let l = self.profile.layout;
+        let width = self.u32(Self::at(p, l.width_offset)?)?;
+        let height = self.u32(Self::at(p, l.height_offset)?)?;
         if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
             return Err(format!(
                 "invalid canvas dimensions {width}x{height} at {p:#x}"
@@ -86,17 +76,21 @@ impl<M: ProcessMemory> Reader<'_, M> {
         }
         Ok(Canvas {
             address: p,
-            id: self.u32(Self::at(p, l.canvas_id_offset)?)?,
+            id: l
+                .id_offset
+                .map(|offset| self.u32(Self::at(p, offset)?))
+                .transpose()?,
             width,
             height,
-            name: self.string(Self::at(p, l.canvas_name_offset)?)?,
-            short_path: self.string(Self::at(p, l.canvas_short_path_offset)?)?,
+            name: self.string(Self::at(p, l.name_offset)?)?,
+            short_path: self.string(Self::at(p, l.short_path_offset)?)?,
         })
     }
     pub fn canvases(&self) -> Result<Vec<Canvas>, String> {
         // Original get_canvas_list(): read the sentinel pointer, collect, discard sentinel.
-        let sentinel = self.required_ptr(Self::at(self.base, self.profile.session_offset)?)?;
-        let mut p = self.ptr(sentinel)?;
+        let RootLocator::FixedRva(rva) = self.profile.locator;
+        let sentinel = self.required_ptr(Self::at(self.base, rva)?)?;
+        let mut p = self.ptr(Self::at(sentinel, self.profile.layout.next_offset)?)?;
         let mut seen = HashSet::from([sentinel]);
         let mut result = Vec::new();
         while p != 0 {
@@ -107,20 +101,32 @@ impl<M: ProcessMemory> Reader<'_, M> {
                 return Err("canvas list exceeds 1024 entries".into());
             }
             result.push(self.read_canvas(p)?);
-            p = self.ptr(p)?;
+            p = self.ptr(Self::at(p, self.profile.layout.next_offset)?)?;
         }
         Ok(result)
     }
     pub fn read_tile_map(&self, canvas: &Canvas) -> Result<TileMap, String> {
-        let l = self.profile;
-        let slot = self.required_ptr(Self::at(canvas.address, l.canvas_tile_map_slot_offset)?)?;
+        let l = self.profile.layout.tiles;
+        let level0_address = Self::at(canvas.address, l.level0_offset)?;
+        let slot = self.required_ptr(level0_address)?;
         let map = self.required_ptr(slot)?;
         let metadata = self.bytes::<32>(map)?;
-        let tree = self.required_ptr(Self::at(map, l.map_tree_offset)?)?;
-        let width = self.u32(Self::at(map, l.map_width_offset)?)?;
-        let height = self.u32(Self::at(map, l.map_height_offset)?)?;
-        let nx = self.u32(Self::at(map, l.map_nx_offset)?)?;
-        let ny = self.u32(Self::at(map, l.map_ny_offset)?)?;
+        let tree = self.required_ptr(Self::at(map, l.tree_offset)?)?;
+        let width = self.u32(Self::at(map, l.width_offset)?)?;
+        let height = self.u32(Self::at(map, l.height_offset)?)?;
+        let nx = self.u32(Self::at(map, l.nx_offset)?)?;
+        let ny = self.u32(Self::at(map, l.ny_offset)?)?;
+        if let Some((nx_offset, ny_offset)) = l.canvas_grid_offsets {
+            let canvas_nx = self.u32(Self::at(canvas.address, nx_offset)?)?;
+            let canvas_ny = self.u32(Self::at(canvas.address, ny_offset)?)?;
+            if (canvas_nx, canvas_ny) != (canvas.width.div_ceil(256), canvas.height.div_ceil(256))
+                || (nx, ny) != (canvas_nx, canvas_ny)
+            {
+                return Err(format!(
+                    "invalid canvas tile grid: {canvas_nx}x{canvas_ny}, map {nx}x{ny}"
+                ));
+            }
+        }
         if (width, height) != (canvas.width, canvas.height)
             || nx != width.div_ceil(256)
             || ny != height.div_ceil(256)
@@ -134,25 +140,13 @@ impl<M: ProcessMemory> Reader<'_, M> {
             ny,
             map,
             slot,
+            level0_address,
             tree,
             metadata,
         })
     }
     pub fn validate_tile_map(&self, canvas: &Canvas, map: &TileMap) -> Result<(), String> {
-        let l = self.profile;
-        let width = self.u32(Self::at(map.map, l.map_width_offset)?)?;
-        let height = self.u32(Self::at(map.map, l.map_height_offset)?)?;
-        let nx = self.u32(Self::at(map.map, l.map_nx_offset)?)?;
-        let ny = self.u32(Self::at(map.map, l.map_ny_offset)?)?;
-        if (width, height) != (canvas.width, canvas.height)
-            || nx != map.nx
-            || ny != map.ny
-            || nx != width.div_ceil(256)
-            || ny != height.div_ceil(256)
-            || self.bytes::<32>(map.map)? != map.metadata
-            || self.required_ptr(map.slot)? != map.map
-            || self.required_ptr(Self::at(map.map, l.map_tree_offset)?)? != map.tree
-        {
+        if self.read_tile_map(canvas)? != *map {
             return Err("tile map changed during capture; retry".into());
         }
         Ok(())
@@ -170,9 +164,16 @@ impl<M: ProcessMemory> Reader<'_, M> {
         if x >= map.nx || y >= map.ny {
             return Err("tile coordinates out of range".into());
         }
-        let row_slot = Self::at(map.tree, y as usize * self.profile.pointer_stride)?;
+        if self.required_ptr(map.level0_address)? != map.slot
+            || self.required_ptr(map.slot)? != map.map
+            || self.required_ptr(Self::at(map.map, self.profile.layout.tiles.tree_offset)?)?
+                != map.tree
+        {
+            return Err("tile map changed during capture; retry".into());
+        }
+        let row_slot = Self::at(map.tree, y as usize * 8)?;
         let row = self.required_ptr(row_slot)?;
-        let tile_slot = Self::at(row, x as usize * self.profile.pointer_stride)?;
+        let tile_slot = Self::at(row, x as usize * 8)?;
         let tile = self.required_ptr(tile_slot)?;
         self.memory.read_into(tile, dst)?;
         if self.ptr(tile_slot)? != tile || self.ptr(row_slot)? != row {
@@ -224,6 +225,7 @@ impl<M: ProcessMemory> Reader<'_, M> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::sai::preview_2026_07_02b::{PROFILE, SESSION_OFFSET};
 
     pub(crate) const BASE: usize = 0x100;
     pub(crate) const SENTINEL: usize = 0x1000;
@@ -239,7 +241,7 @@ pub(crate) mod tests {
 
     impl FakeMemory {
         pub(crate) fn new() -> Self {
-            Self(vec![0; 4 * 1024 * 1024])
+            Self(vec![0; 5 * 1024 * 1024])
         }
 
         pub(crate) fn put(&mut self, address: usize, bytes: &[u8]) {
@@ -304,18 +306,50 @@ pub(crate) mod tests {
         mem
     }
 
+    /// Isolated fixture for the 2026-10-19 layout. It deliberately writes no
+    /// legacy-preview session or canvas fields, so profile mixups fail closed.
+    pub(crate) fn renovated_fixture() -> FakeMemory {
+        let mut mem = FakeMemory::new();
+        mem.ptr(BASE + 0x47a380, SENTINEL);
+        mem.ptr(SENTINEL, CANVAS);
+        mem.ptr(CANVAS, 0);
+
+        mem.u32(CANVAS + 0x28, 257);
+        mem.u32(CANVAS + 0x2c, 1);
+        mem.ptr(CANVAS + 0x48, SLOT);
+        mem.u32(CANVAS + 0x180, 2);
+        mem.u32(CANVAS + 0x184, 1);
+        mem.utf16(CANVAS + 0x8f8, "renovated synthetic");
+        mem.utf16(CANVAS + 0xb00, "renovated.sai");
+
+        mem.ptr(SLOT, MAP);
+        mem.ptr(MAP + 8, TREE);
+        mem.u32(MAP + 0x10, 257);
+        mem.u32(MAP + 0x14, 1);
+        mem.u32(MAP + 0x18, 2);
+        mem.u32(MAP + 0x1c, 1);
+        mem.ptr(TREE, ROW);
+        mem.ptr(ROW, TILE0);
+        mem.ptr(ROW + 8, TILE1);
+        mem.put(TILE0, &[30, 20, 10, 255]);
+        mem.put(TILE0 + 255 * 4, &[60, 50, 40, 255]);
+        mem.put(TILE1, &[90, 80, 70, 255]);
+
+        mem
+    }
+
     #[test]
     fn composites_and_crops_two_bgra_tiles_and_skips_sentinel() {
         let mem = fixture();
         let reader = Reader {
             memory: &mem,
             base: BASE,
-            profile: &LAYOUT,
+            profile: &PROFILE,
         };
         let canvases = reader.canvases().unwrap();
         assert_eq!(canvases.len(), 1);
         let canvas = &canvases[0];
-        assert_eq!((canvas.id, canvas.width, canvas.height), (42, 257, 1));
+        assert_eq!((canvas.id, canvas.width, canvas.height), (Some(42), 257, 1));
         assert_eq!(
             (&*canvas.name, &*canvas.short_path),
             ("synthetic", "synthetic.sai")
@@ -336,7 +370,7 @@ pub(crate) mod tests {
         let reader = Reader {
             memory: &mem,
             base: BASE,
-            profile: &LAYOUT,
+            profile: &PROFILE,
         };
         let canvas = reader.canvases().unwrap().remove(0);
         assert!(
@@ -354,7 +388,7 @@ pub(crate) mod tests {
         let reader = Reader {
             memory: &mem,
             base: BASE,
-            profile: &LAYOUT,
+            profile: &PROFILE,
         };
         assert!(
             reader
@@ -362,5 +396,165 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .contains("cycle in canvas list")
         );
+    }
+
+    #[test]
+    fn renovated_profile_reads_and_composites_expected_pixels() {
+        use crate::sai::renovated_2026_10_19::PROFILE as RENOVATED;
+
+        let mem = renovated_fixture();
+        let reader = Reader {
+            memory: &mem,
+            base: BASE,
+            profile: &RENOVATED,
+        };
+        let canvas = reader.canvases().unwrap().remove(0);
+        assert_eq!((canvas.id, canvas.width, canvas.height), (None, 257, 1));
+        assert_eq!(
+            (&*canvas.name, &*canvas.short_path),
+            ("renovated synthetic", "renovated.sai")
+        );
+        assert_eq!(
+            reader.composite(&canvas, false).unwrap(),
+            fixture_reader_rgb()
+        );
+    }
+
+    fn fixture_reader_rgb() -> Vec<u8> {
+        let mem = fixture();
+        let reader = Reader {
+            memory: &mem,
+            base: BASE,
+            profile: &PROFILE,
+        };
+        let canvas = reader.canvases().unwrap().remove(0);
+        reader.composite(&canvas, false).unwrap()
+    }
+
+    #[test]
+    fn renovated_fixture_rejects_legacy_profile() {
+        let mem = renovated_fixture();
+        let reader = Reader {
+            memory: &mem,
+            base: BASE,
+            profile: &PROFILE,
+        };
+        assert!(reader.canvases().unwrap_err().contains("null pointer"));
+    }
+
+    #[test]
+    fn renovated_reader_rejects_canvas_map_grid_mismatch() {
+        use crate::sai::renovated_2026_10_19::PROFILE as RENOVATED;
+
+        let mut mem = renovated_fixture();
+        mem.u32(CANVAS + 0x180, 1);
+        let reader = Reader {
+            memory: &mem,
+            base: BASE,
+            profile: &RENOVATED,
+        };
+        let canvas = reader.canvases().unwrap().remove(0);
+        assert!(
+            reader
+                .read_tile_map(&canvas)
+                .unwrap_err()
+                .contains("invalid canvas tile grid")
+        );
+    }
+
+    #[test]
+    fn renovated_reader_detects_pointer_and_metadata_changes() {
+        use crate::sai::renovated_2026_10_19::PROFILE as RENOVATED;
+
+        let mut mem = renovated_fixture();
+        let (_canvas, map) = {
+            let reader = Reader {
+                memory: &mem,
+                base: BASE,
+                profile: &RENOVATED,
+            };
+            let canvas = reader.canvases().unwrap().remove(0);
+            let map = reader.read_tile_map(&canvas).unwrap();
+            (canvas, map)
+        };
+        let mut tile = vec![0; 256 * 256 * 4];
+
+        mem.ptr(SLOT, TILE0);
+        let reader = Reader {
+            memory: &mem,
+            base: BASE,
+            profile: &RENOVATED,
+        };
+        assert!(
+            reader
+                .read_tile_into(&map, 0, 0, &mut tile)
+                .unwrap_err()
+                .contains("tile map changed")
+        );
+
+        mem.ptr(SLOT, MAP);
+        let (canvas, stable_map) = {
+            let reader = Reader {
+                memory: &mem,
+                base: BASE,
+                profile: &RENOVATED,
+            };
+            let canvas = reader.canvases().unwrap().remove(0);
+            let map = reader.read_tile_map(&canvas).unwrap();
+            (canvas, map)
+        };
+        mem.ptr(MAP + 8, ROW);
+        let reader = Reader {
+            memory: &mem,
+            base: BASE,
+            profile: &RENOVATED,
+        };
+        assert!(
+            reader
+                .validate_tile_map(&canvas, &stable_map)
+                .unwrap_err()
+                .contains("tile map changed")
+        );
+    }
+    #[test]
+    fn renovated_capture_rejects_invalidation_during_tile_read() {
+        use std::cell::RefCell;
+        struct MutatingMemory {
+            memory: RefCell<FakeMemory>,
+            changed_address: usize,
+            replacement: Vec<u8>,
+        }
+        impl ProcessMemory for MutatingMemory {
+            fn read_into(&self, address: usize, dst: &mut [u8]) -> Result<(), String> {
+                let mut memory = self.memory.borrow_mut();
+                memory.read_into(address, dst)?;
+                if address == TILE0 {
+                    memory.put(self.changed_address, &self.replacement);
+                }
+                Ok(())
+            }
+        }
+        for (changed_address, replacement) in [
+            (CANVAS + 0x28, 258u32.to_le_bytes().to_vec()),
+            (CANVAS + 0x48, 0u64.to_le_bytes().to_vec()),
+            (ROW, 0u64.to_le_bytes().to_vec()),
+            (MAP, 1u64.to_le_bytes().to_vec()),
+        ] {
+            let memory = MutatingMemory {
+                memory: RefCell::new(renovated_fixture()),
+                changed_address,
+                replacement,
+            };
+            let reader = Reader {
+                memory: &memory,
+                base: BASE,
+                profile: &crate::sai::renovated_2026_10_19::PROFILE,
+            };
+            let canvas = reader.canvases().unwrap().remove(0);
+            assert!(
+                reader.composite(&canvas, false).is_err(),
+                "mutation at {changed_address:#x}"
+            );
+        }
     }
 }

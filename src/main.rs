@@ -27,7 +27,7 @@ fn run() -> Result<(), String> {
             d.checkpoint_changed_ratio
         );
         println!(
-            "Target: SAI2 x64 2026-07-02b Technical Preview. Ctrl-C drains recording storage."
+            "Target: known SAI2 x64 Preview and Major Renovated builds. Ctrl-C drains recording storage."
         );
         return Ok(());
     }
@@ -100,21 +100,22 @@ fn run() -> Result<(), String> {
         digest.consume(&block[..n]);
     }
     let hash = format!("{:x}", digest.compute());
-    if hash != sai::preview_2026_07_02b::MD5 {
-        return Err(format!(
-            "unsupported sai2.exe MD5 {hash}; expected {}",
-            sai::preview_2026_07_02b::MD5
-        ));
-    }
+    let profile = sai::profile::identify(&hash)?;
     if args[0] == "detect" {
         println!("Found sai2.exe (PID: {})", process.pid);
         println!("Module base: {:#x}", process.base_address);
+        println!(
+            "Profile: {} ({})",
+            profile.display_name,
+            profile.generation.name()
+        );
+        println!("Executable MD5: {hash}");
         return Ok(());
     }
     let reader = sai::reader::Reader {
         memory: &process,
         base: process.base_address,
-        profile: &sai::preview_2026_07_02b::LAYOUT,
+        profile,
     };
     let canvases = reader.canvases()?;
     if args[0] == "canvases" {
@@ -136,7 +137,6 @@ fn run() -> Result<(), String> {
                 &reader,
                 c,
                 Path::new(&args[2]),
-                &hash,
                 recorder::Config::parse(&args[3..])?,
             );
         }

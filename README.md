@@ -1,7 +1,11 @@
 # timelapse4sai2
 
-Linux 原生 Rust CLI，专用于 **SAI Ver.2 64bit – 2026-07-02b Technical Preview**。
-固定 session RVA `0x32eb20`，可执行文件 MD5 必须为 `6f3f351303cf3896f4c2977925c994c2`。
+Linux 原生 Rust CLI，支持以下 SAI Ver.2 64bit build；未知 MD5 明确拒绝，不猜测布局。
+
+| Build | MD5 | Session RVA |
+| --- | --- | --- |
+| Preview 2026-07-02b | `6f3f351303cf3896f4c2977925c994c2` | `0x32eb20` |
+| Major Renovated 2026-10-19 | `44aee0ba61ea9f215b1b4dcb4d6d23e0` | `0x47a380` |
 
 ```sh
 cargo build --release
@@ -21,9 +25,9 @@ Bottles/Flatpak 的可执行文件通过 `/proc/PID/root` 打开并校验 MD5。
 ## 读取布局
 
 - `*(base + RVA)` 是链表哨兵，读取其 `next_canvas` 后开始枚举。
-- `*(canvas + 0x28)` 为 level 0 slot，再读取 `*slot` 获得 tile map。
+- Preview 的 level-0 entry 在 `canvas + 0x28`，Renovated 在 `canvas + 0x48`；读取 entry 获得 slot，再读取 `*slot` 获得 tile map。
 - `tree[y]` 是行指针，`row[x]` 是 256×256×4 tile。
-- 校验 map 尺寸与 canvas 一致、tile 数量精确等于向上取整的尺寸。
+- 校验 map 尺寸与 canvas 一致、tile 数量精确等于向上取整的尺寸；Renovated 还校验 canvas 的 `+0x180/+0x184` grid。
 - 直接复制有效像素至 RGB buffer，避免分配完整 padding buffer。
 
 布局依据：[原项目 sai.py](https://github.com/cromachina/art-timelapse/blob/main/src/art_timelapse/sai.py)。
@@ -86,7 +90,7 @@ blob 索引内存随 unique blobs 增长；存储慢会拉长候选间隔，不�
 结构校验失败会 Abort，未引用的已写 blob 可保留；失败候选有重试机会，连续 10 次失败
 或画布关闭则明确停止。SAI 原地像素修改仍不保证原子快照。
 
-活跃选择使用地址 + SAI id，manifest 保存 name/path，不将 canvas index 当作持久身份。
+活跃选择使用地址 + 可用的 SAI id（Renovated 无 id 字段），manifest 保存实际 build、generation、MD5 与 name/path，不将 canvas index 当作持久身份。
 这些不是跨进程文档 UUID；继续 session 需明确选择且名字/路径一致，
 无法证明同名文件或地址/id 重用一定是原文档，不自动跨画布追踪。
 二进制布局与恢复保证见 [存储格式](docs/recording-format.md)。

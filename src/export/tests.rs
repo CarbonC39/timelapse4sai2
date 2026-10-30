@@ -35,6 +35,7 @@ impl Fixture {
         let manifest = Manifest {
             format_version: 1,
             sai_profile: "test".into(),
+            sai_generation: None,
             source_executable_md5: "test-md5".into(),
             initial_width: 257,
             initial_height: 1,

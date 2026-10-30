@@ -65,6 +65,8 @@ struct Blob {
 pub struct Manifest {
     pub format_version: u32,
     pub sai_profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sai_generation: Option<String>,
     pub source_executable_md5: String,
     pub initial_width: u32,
     pub initial_height: u32,

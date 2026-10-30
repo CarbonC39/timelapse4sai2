@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     recorder::storage::Event,
-    sai::{preview_2026_07_02b::LAYOUT, reader::Reader, reader::tests as fixture},
+    sai::{preview_2026_07_02b::PROFILE, reader::Reader, reader::tests as fixture},
 };
 use std::{fs, path::PathBuf, sync::mpsc};
 
@@ -20,6 +20,7 @@ fn manifest() -> Manifest {
     Manifest {
         format_version: 1,
         sai_profile: "test".into(),
+        sai_generation: None,
         source_executable_md5: "test".into(),
         initial_width: 257,
         initial_height: 1,
@@ -39,7 +40,7 @@ fn fixture_reader(
     let reader = Reader {
         memory: mem,
         base: fixture::BASE,
-        profile: &LAYOUT,
+        profile: &PROFILE,
     };
     let canvas = reader.canvases().unwrap().remove(0);
     (reader, canvas)
@@ -220,7 +221,7 @@ fn missing_canvas_stops_capture_before_sending_a_candidate() {
     let reader = Reader {
         memory: &mem,
         base: fixture::BASE,
-        profile: &LAYOUT,
+        profile: &PROFILE,
     };
     assert!(
         capture
@@ -514,4 +515,80 @@ fn reopening_reports_corrupt_blob_record_and_missing_referenced_blob() {
             .contains("missing referenced blob")
     );
     fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn both_profiles_share_capture_storage_and_offline_replay() {
+    use crate::sai::{preview_2026_07_02b, renovated_2026_10_19};
+    let mut states = Vec::new();
+    for (profile, mut mem) in [
+        (&preview_2026_07_02b::PROFILE, fixture::fixture()),
+        (&renovated_2026_10_19::PROFILE, fixture::renovated_fixture()),
+    ] {
+        let path = dir(profile.generation.name());
+        let mut capture = CaptureState::default();
+        let (tx, rx) = mpsc::sync_channel(16);
+        let mut metrics = Metrics::default();
+        let mut store = {
+            let reader = Reader {
+                memory: &mem,
+                base: fixture::BASE,
+                profile,
+            };
+            let canvas = reader.canvases().unwrap().remove(0);
+            let manifest = recording_manifest(&reader, &canvas);
+            assert_eq!(manifest.sai_profile, profile.display_name);
+            assert_eq!(manifest.source_executable_md5, profile.executable_hash);
+            assert_eq!(
+                manifest.sai_generation.as_deref(),
+                Some(profile.generation.name())
+            );
+            Store::open(&path, manifest, Config::default()).unwrap()
+        };
+        for step in 0..3 {
+            if step == 2 {
+                mem.put(fixture::TILE1, &[91]);
+            }
+            let reader = Reader {
+                memory: &mem,
+                base: fixture::BASE,
+                profile,
+            };
+            let canvas = reader.canvases().unwrap().remove(0);
+            capture
+                .capture(&reader, &canvas, FrameKind::Stable, &tx, &mut metrics)
+                .unwrap();
+            apply(&mut store, &rx);
+        }
+        assert_eq!(store.metrics.logical_frames, 2);
+        assert_eq!(store.metrics.tiles_changed, 3);
+        states.push(store.state.clone());
+        drop(store);
+        storage::verify(&path).unwrap();
+        let mut session = storage::Session::open(&path).unwrap();
+        assert!(session.next_batch().unwrap().is_some());
+        let raw = session
+            .load_blob(states.last().unwrap().tiles[&(1, 0)])
+            .unwrap();
+        assert_eq!(&raw[..4], &[91, 80, 70, 0]);
+        drop(session);
+        // Existing v1 manifests without generation remain readable.
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(path.join("manifest.json")).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("sai_generation");
+        fs::write(
+            path.join("manifest.json"),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            storage::Session::open(&path)
+                .unwrap()
+                .manifest
+                .sai_generation
+                .is_none()
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+    assert_eq!(states[0], states[1]);
 }
