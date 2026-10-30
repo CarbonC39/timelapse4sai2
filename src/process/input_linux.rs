@@ -1,7 +1,4 @@
 //! Nonblocking Linux evdev activity watcher.
-//!
-//! The recorder intentionally watches `/dev/input/event*` directly so it does
-//! not depend on a desktop session or an additional input library.
 
 use std::{
     collections::HashSet,
@@ -41,10 +38,7 @@ impl InputWatcher {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if !name.starts_with("event") {
-                continue;
-            }
-            if known.contains(&path) {
+            if !name.starts_with("event") || known.contains(&path) {
                 continue;
             }
             let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
@@ -68,8 +62,6 @@ impl InputWatcher {
             }
         }
         if !found.is_empty() {
-            // Keep descriptors already opened; newly connected devices are added
-            // during periodic scans. The path list is stable for a scan.
             self.devices.extend(found);
             return Ok(());
         }
@@ -84,8 +76,6 @@ impl InputWatcher {
         Err(input_error(detail))
     }
 
-    /// Drain pending input records without waiting. Returns true if any real
-    /// key, pointer, or tablet event arrived since the previous call.
     pub fn poll_activity(&mut self, now_ms: u64) -> Result<bool, String> {
         let mut activity = false;
         let mut dead = Vec::new();
@@ -102,7 +92,6 @@ impl InputWatcher {
                 if n == std::mem::size_of::<libc::input_event>() as isize {
                     // SAFETY: a complete input_event record was read.
                     let ev = unsafe { ev.assume_init() };
-                    // Linux input-event type values from <linux/input-event-codes.h>.
                     if matches!(ev.type_, 1 | 2 | 3) {
                         activity = true;
                     }
@@ -120,8 +109,6 @@ impl InputWatcher {
                     dead.push(idx);
                     break;
                 } else {
-                    // Evdev records are atomic; a short read indicates a removed
-                    // or unusable descriptor.
                     dead.push(idx);
                     break;
                 }

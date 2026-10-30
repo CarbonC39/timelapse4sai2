@@ -3,8 +3,7 @@ mod image;
 mod process;
 mod recorder;
 mod sai;
-use process::LinuxProcess;
-use std::{fs::File, io::Read, path::Path};
+use std::path::Path;
 
 fn run() -> Result<(), String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -57,7 +56,7 @@ fn run() -> Result<(), String> {
             args[1]
                 .parse::<u32>()
                 .ok()
-                .filter(|&p| p > 0 && p <= i32::MAX as u32)
+                .filter(|&p| p > 0)
                 .ok_or("invalid PID")?,
         );
         args.drain(..2);
@@ -80,26 +79,8 @@ fn run() -> Result<(), String> {
         Some("record") if args.len() >= 3 => { recorder::Config::parse(&args[3..])?; },
         _ => return Err("usage: timelapse4sai2 [--pid PID] detect|canvases|dump INDEX FILE|record INDEX SESSION_DIR [OPTIONS] [--channel-order bgra|rgba]".into()),
     }
-    let process = LinuxProcess::discover(pid)?;
-    // Hash the mapped executable through the target mount namespace (Bottles/Flatpak).
-    let rooted = Path::new(&format!("/proc/{}/root", process.pid)).join(
-        process
-            .module_path
-            .strip_prefix("/")
-            .map_err(|e| e.to_string())?,
-    );
-    let mut file = File::open(&rooted)
-        .map_err(|e| format!("cannot open mapped executable {}: {e}", rooted.display()))?;
-    let mut digest = md5::Context::new();
-    let mut block = [0u8; 65536];
-    loop {
-        let n = file.read(&mut block).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        digest.consume(&block[..n]);
-    }
-    let hash = format!("{:x}", digest.compute());
+    let process = process::discover(pid)?;
+    let hash = process::executable_hash(&process)?;
     let profile = sai::profile::identify(&hash)?;
     if args[0] == "detect" {
         println!("Found sai2.exe (PID: {})", process.pid);

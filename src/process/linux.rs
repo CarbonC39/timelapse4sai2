@@ -22,6 +22,15 @@ struct MapRegion {
 }
 
 impl LinuxProcess {
+    pub fn executable_path(&self) -> PathBuf {
+        // Resolve Bottles/Flatpak paths in the target's mount namespace.
+        PathBuf::from(format!("/proc/{}/root", self.pid)).join(
+            self.module_path
+                .strip_prefix("/")
+                .unwrap_or(&self.module_path),
+        )
+    }
+
     /// Find the unique running process whose command line, comm, or mapped image
     /// identifies it as sai2.exe. If `pid` is supplied, only that process is
     /// considered.
@@ -111,6 +120,10 @@ impl LinuxProcess {
             module_path,
         }))
     }
+}
+
+pub fn sync_directory(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
 }
 
 impl ProcessMemory for LinuxProcess {

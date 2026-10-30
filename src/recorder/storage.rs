@@ -7,7 +7,6 @@ use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::fd::AsRawFd,
     path::Path,
 };
 use xxhash_rust::xxh3::xxh3_128;
@@ -146,7 +145,7 @@ impl Store {
     pub fn open(dir: &Path, manifest: Manifest, config: Config) -> Result<Self, String> {
         fs::create_dir_all(dir).map_err(err)?;
         let lock = open(&dir.join("session.lock"))?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if lock.try_lock().is_err() {
             return Err("session is already open by another recorder".into());
         }
         let path = dir.join("manifest.json");
@@ -171,7 +170,7 @@ impl Store {
                 .map_err(err)?;
             f.sync_all().map_err(err)?;
             fs::rename(dir.join("manifest.tmp"), &path).map_err(err)?;
-            File::open(dir).map_err(err)?.sync_all().map_err(err)?;
+            crate::process::sync_directory(dir).map_err(err)?;
         }
         let mut s = Self {
             _lock: lock,
@@ -457,7 +456,7 @@ pub struct Session {
 impl Session {
     pub fn open(dir: &Path) -> Result<Self, String> {
         let lock = File::open(dir.join("session.lock")).map_err(err)?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+        if lock.try_lock_shared().is_err() {
             return Err("session is open by a recorder; stop recording before exporting".into());
         }
         let manifest: Manifest =

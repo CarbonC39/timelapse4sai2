@@ -1,4 +1,3 @@
-mod input;
 mod scheduler;
 pub mod storage;
 #[cfg(test)]
@@ -207,9 +206,6 @@ impl CaptureState {
     }
 }
 static STOP: AtomicBool = AtomicBool::new(false);
-extern "C" fn stop(_: libc::c_int) {
-    STOP.store(true, Ordering::Relaxed);
-}
 fn recording_manifest<M: ProcessMemory>(reader: &Reader<M>, canvas: &Canvas) -> Manifest {
     Manifest {
         format_version: 1,
@@ -241,15 +237,12 @@ pub fn record<M: ProcessMemory>(
     let mut input = if config.no_input_watch {
         None
     } else {
-        Some(input::InputWatcher::new()?)
+        Some(crate::process::InputWatcher::new()?)
     };
     let manifest = recording_manifest(reader, canvas);
     let store = Store::open(dir, manifest, config.clone())?;
     STOP.store(false, Ordering::Relaxed);
-    unsafe {
-        libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, stop as *const () as libc::sighandler_t);
-    }
+    crate::process::install_stop_handler(&STOP)?;
     let (tx, rx) = sync_channel(2);
     let (recycle_tx, recycle_rx) = sync_channel(4);
     let worker = std::thread::spawn(move || -> Result<Metrics, String> {

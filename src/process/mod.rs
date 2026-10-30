@@ -4,7 +4,61 @@
 mod linux;
 
 #[cfg(target_os = "linux")]
-pub use linux::LinuxProcess;
+use linux::LinuxProcess as Process;
+#[cfg(target_os = "linux")]
+pub use linux::sync_directory;
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+use windows::WindowsProcess as Process;
+#[cfg(target_os = "windows")]
+pub use windows::sync_directory;
+
+#[cfg(not(any(
+    target_os = "linux",
+    all(target_os = "windows", target_arch = "x86_64")
+)))]
+compile_error!("supported platforms are Linux and Windows x64");
+
+#[cfg(target_os = "linux")]
+#[path = "input_linux.rs"]
+mod input;
+#[cfg(target_os = "windows")]
+#[path = "input_windows.rs"]
+mod input;
+pub use input::InputWatcher;
+
+#[cfg(target_os = "linux")]
+#[path = "signals_linux.rs"]
+mod signals;
+#[cfg(target_os = "windows")]
+#[path = "signals_windows.rs"]
+mod signals;
+pub use signals::install_stop_handler;
+
+pub fn discover(pid: Option<u32>) -> Result<Process, String> {
+    Process::discover(pid)
+}
+
+/// Hash the on-disk executable, using the backend's filesystem namespace.
+pub fn executable_hash(process: &Process) -> Result<String, String> {
+    use std::io::Read;
+    let path = process.executable_path();
+    let mut file = std::fs::File::open(&path)
+        .map_err(|e| format!("cannot open executable {}: {e}", path.display()))?;
+    let mut digest = md5::Context::new();
+    let mut block = [0u8; 65536];
+    loop {
+        let n = file
+            .read(&mut block)
+            .map_err(|e| format!("cannot read executable {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        digest.consume(&block[..n]);
+    }
+    Ok(format!("{:x}", digest.compute()))
+}
 
 /// Reads bytes from another process' address space.
 pub trait ProcessMemory {
