@@ -1,0 +1,9 @@
+[package]
+name = "sai-memory-probe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2"
+md5 = "0.7"
+png = "0.17"
