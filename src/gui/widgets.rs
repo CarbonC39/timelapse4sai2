@@ -41,10 +41,20 @@ pub fn form_label(ui: &mut egui::Ui, i18n: Translator, key: Key) -> Response {
     response
 }
 
+fn help_size(ui: &egui::Ui) -> f32 {
+    ui.spacing().interact_size.y.min(22.0).max(18.0)
+}
+
+/// Reserve the same width as a help icon for rows without a tooltip, keeping
+/// control columns aligned throughout an advanced panel.
+pub fn help_slot(ui: &mut egui::Ui) {
+    ui.allocate_exact_size(Vec2::splat(help_size(ui)), Sense::hover());
+}
+
 /// Small, quiet `?` affordance placed after a field label. The tooltip is the
 /// explanation body only; the label is already visible next to the icon.
 pub fn help_icon(ui: &mut egui::Ui, i18n: Translator, tip: Key) -> Response {
-    let size = ui.spacing().interact_size.y.min(22.0).max(18.0);
+    let size = help_size(ui);
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let color = if response.hovered() {
         ui.visuals().text_color()

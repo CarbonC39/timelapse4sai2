@@ -5,8 +5,8 @@ use super::{
     preview::Preview,
     settings::{FontWindow, Settings},
     widgets::{
-        ActionStyle, Icon, action_button, advanced_toggle, form_label, help_icon, icon_button,
-        metrics_row, paint_icon, path_edit,
+        ActionStyle, Icon, action_button, advanced_toggle, form_label, help_icon, help_slot,
+        icon_button, metrics_row, paint_icon, path_edit,
     },
 };
 use eframe::egui;
@@ -146,7 +146,7 @@ impl App {
             stop: Arc::new(AtomicBool::new(false)),
             config: recorder::Config::default(),
             exporting: ExportState::Idle,
-            options: Options::default(),
+            options: gui_options(),
             plan: None,
             plan_revision: 0,
             preview: Preview::default(),
@@ -1288,6 +1288,13 @@ impl eframe::App for App {
         self.settings.save(storage);
     }
 }
+/// GUI exports default to stable captures; the CLI keeps its documented
+/// default of including provisional states unless `--skip-provisional` is set.
+fn gui_options() -> Options {
+    let mut options = Options::default();
+    options.skip_provisional = true;
+    options
+}
 fn clone_options(o: &Options) -> Options {
     Options {
         fps: o.fps,
@@ -1365,8 +1372,11 @@ fn form_row<R>(
 ) -> R {
     ui.horizontal(|ui| {
         form_label(ui, i18n, label);
-        if let Some(tip) = tip {
-            help_icon(ui, i18n, tip);
+        match tip {
+            Some(tip) => {
+                help_icon(ui, i18n, tip);
+            }
+            None => help_slot(ui),
         }
         body(ui)
     })
@@ -1453,19 +1463,74 @@ fn choice_combo<T: Copy + PartialEq>(
     value: &mut T,
     choices: &[(T, Key)],
 ) {
-    egui::ComboBox::from_id_salt(id)
-        .width(ui.available_width())
-        .truncate()
-        .selected_text(
-            choices
-                .iter()
-                .find(|(v, _)| v == value)
-                .map(|(_, key)| i18n.tr(*key))
-                .unwrap_or_default(),
-        )
-        .show_ui(ui, |ui| {
-            for (v, key) in choices {
-                ui.selectable_value(value, *v, i18n.tr(*key));
+    let text = choices
+        .iter()
+        .find(|(choice, _)| choice == value)
+        .map(|(_, key)| i18n.tr(*key))
+        .unwrap_or_default();
+    let width = ui.available_width().max(1.0);
+    let height = ui.spacing().interact_size.y.max(28.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let response = ui
+        .interact(rect, ui.id().with(("choice-combo", id)), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let visuals = ui.style().interact(&response);
+    ui.painter().rect(
+        rect,
+        4.0,
+        visuals.bg_fill,
+        visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let text_color = visuals.fg_stroke.color;
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let text_painter = ui
+        .painter()
+        .with_clip_rect(rect.shrink2(egui::vec2(22.0, 0.0)));
+    text_painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        font,
+        text_color,
+    );
+    let arrow = egui::pos2(rect.right() - 12.0, rect.center().y);
+    let stroke = egui::Stroke::new(1.4, text_color);
+    ui.painter()
+        .line_segment([arrow + egui::vec2(-4.0, -2.0), arrow + egui::vec2(0.0, 2.0)], stroke);
+    ui.painter()
+        .line_segment([arrow + egui::vec2(0.0, 2.0), arrow + egui::vec2(4.0, -2.0)], stroke);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, ui.is_enabled(), text)
+    });
+    egui::Popup::menu(&response)
+        .width(rect.width())
+        .show(|ui| {
+            for (index, (choice, key)) in choices.iter().enumerate() {
+                let (item_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+                let item = ui.interact(
+                    item_rect,
+                    ui.id().with(("choice-combo-item", id, index)),
+                    egui::Sense::click(),
+                );
+                let selected = *choice == *value;
+                let item_visuals = ui.style().interact_selectable(&item, selected);
+                if selected || item.hovered() {
+                    ui.painter()
+                        .rect_filled(item_rect, 3.0, item_visuals.weak_bg_fill);
+                }
+                let font = egui::TextStyle::Button.resolve(ui.style());
+                ui.painter().with_clip_rect(item_rect).text(
+                    item_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    i18n.tr(*key),
+                    font,
+                    item_visuals.fg_stroke.color,
+                );
+                if item.clicked() {
+                    *value = *choice;
+                }
             }
         });
 }
@@ -1473,6 +1538,10 @@ fn choice_combo<T: Copy + PartialEq>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gui_exports_skip_provisional_captures_by_default() {
+        assert!(gui_options().skip_provisional);
+    }
     #[test]
     fn recent_session_labels_use_the_directory_basename() {
         assert_eq!(
