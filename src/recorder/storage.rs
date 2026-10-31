@@ -177,6 +177,7 @@ pub struct RecordingStats {
     pub captures: u64,
     pub stable_captures: u64,
     pub provisional_captures: u64,
+    pub disk_bytes: u64,
 }
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
@@ -312,6 +313,7 @@ impl Store {
             captures: self.stats.captures,
             stable_captures: self.stats.stable_captures,
             provisional_captures: self.stats.provisional_captures,
+            disk_bytes: disk_bytes(&self.dir).unwrap_or(0),
         }
     }
     pub fn flush_stats(&mut self) -> Result<(), String> {

@@ -1,0 +1,1208 @@
+use super::{
+    i18n::{Key, format_canvas, format_dimensions, format_size, tr},
+    preview::Preview,
+    settings::{FontWindow, Settings},
+    widgets::{Icon, action_button, icon_button, paint_icon},
+};
+use eframe::egui;
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
+    time::Duration,
+};
+use timelapse4sai2::{
+    connection::{Connection, ConnectionError},
+    export::{self, CanvasMode, Encoder, ExportPlan, Options, Quality, Size},
+    preview::PreviewImage,
+    recorder::{
+        self,
+        storage::{RecordingStats, Session, SessionSummary},
+    },
+    sai::{canvas::Canvas, profile::CompatibilityStatus},
+};
+
+const REPOSITORY: &str = "https://github.com/CarbonC39/timelapse4sai2";
+#[derive(PartialEq)]
+enum RecordingState {
+    Idle,
+    Starting,
+    Recording,
+    Stopping,
+    Error(String),
+}
+#[derive(PartialEq)]
+enum ExportState {
+    Idle,
+    Planning,
+    Exporting,
+    Finished,
+    Error(String),
+}
+struct Detected {
+    pid: u32,
+    canvases: Vec<Canvas>,
+    compatibility: CompatibilityStatus,
+}
+enum Message {
+    Detected(Result<Detected, ConnectionError>),
+    Preview(u64, Result<PreviewImage, String>),
+    Session(u64, Result<SessionSummary, String>),
+    Plan(u64, Result<ExportPlan, String>),
+    RecordingPath(u64, Result<Option<SessionSummary>, String>),
+    ExportProgress(u64, u64),
+    Stats(RecordingStats),
+    Recorded(Result<Vec<String>, String>),
+    Exported(Result<Vec<String>, String>),
+    Path(Dialog, Option<PathBuf>),
+    OpenError(Result<(), String>),
+}
+#[derive(Clone, Copy)]
+enum Dialog {
+    OpenSession,
+    SessionFolder,
+    Output,
+}
+
+pub struct App {
+    settings: Settings,
+    font_window: FontWindow,
+    tx: Sender<Message>,
+    rx: Receiver<Message>,
+    detected: Option<Detected>,
+    detecting: bool,
+    connection_error: Option<ConnectionError>,
+    selected: usize,
+    session_path: String,
+    output_path: String,
+    session_source: bool,
+    summary: Option<SessionSummary>,
+    stats: Option<RecordingStats>,
+    session_error: Option<String>,
+    recording_warnings: Vec<String>,
+    export_warnings: Vec<String>,
+    recording: RecordingState,
+    stop: Arc<AtomicBool>,
+    config: recorder::Config,
+    exporting: ExportState,
+    options: Options,
+    plan: Option<ExportPlan>,
+    plan_revision: u64,
+    preview: Preview,
+    preview_revision: u64,
+    session_revision: u64,
+    about: bool,
+    closing: bool,
+    dialog_open: bool,
+    session_edited: bool,
+    plan_due: Option<std::time::Instant>,
+    plan_running: bool,
+    export_progress: (u64, u64),
+}
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let settings = Settings::load(cc.storage);
+        settings.apply(&cc.egui_ctx);
+        let (tx, rx) = mpsc::channel();
+        let mut app = Self {
+            settings,
+            font_window: FontWindow::default(),
+            tx,
+            rx,
+            detected: None,
+            detecting: false,
+            connection_error: None,
+            selected: 0,
+            session_path: String::new(),
+            output_path: String::new(),
+            session_source: false,
+            summary: None,
+            stats: None,
+            session_error: None,
+            recording_warnings: Vec::new(),
+            export_warnings: Vec::new(),
+            recording: RecordingState::Idle,
+            stop: Arc::new(AtomicBool::new(false)),
+            config: recorder::Config::default(),
+            exporting: ExportState::Idle,
+            options: Options::default(),
+            plan: None,
+            plan_revision: 0,
+            preview: Preview::default(),
+            preview_revision: 0,
+            session_revision: 0,
+            about: false,
+            closing: false,
+            dialog_open: false,
+            session_edited: false,
+            plan_due: None,
+            plan_running: false,
+            export_progress: (0, 0),
+        };
+        app.refresh_connection();
+        app
+    }
+    fn recording_busy(&self) -> bool {
+        matches!(
+            self.recording,
+            RecordingState::Starting | RecordingState::Recording | RecordingState::Stopping
+        )
+    }
+    fn export_busy(&self) -> bool {
+        self.exporting == ExportState::Exporting
+    }
+    fn launch(&self, task: impl FnOnce() -> Message + Send + 'static) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(task());
+        });
+    }
+    fn refresh_connection(&mut self) {
+        if self.detecting {
+            return;
+        }
+        self.detecting = true;
+        self.launch(|| {
+            Message::Detected(Connection::discover_detailed(None).map(|c| Detected {
+                pid: c.process.pid,
+                canvases: c.canvases,
+                compatibility: c.compatibility,
+            }))
+        });
+    }
+    fn request_preview(&mut self) {
+        if self.preview.loading {
+            return;
+        }
+        self.preview_revision += 1;
+        let revision = self.preview_revision;
+        self.preview.loading = true;
+        if self.session_source {
+            let path = PathBuf::from(&self.session_path);
+            self.launch(move || {
+                Message::Preview(
+                    revision,
+                    PreviewImage::from_session_final(&path, 512, 512 * 512),
+                )
+            });
+        } else if let Some((pid, canvas)) = self
+            .detected
+            .as_ref()
+            .and_then(|d| d.canvases.get(self.selected).map(|c| (d.pid, c.clone())))
+        {
+            self.launch(move || {
+                Message::Preview(
+                    revision,
+                    (|| {
+                        let connection = Connection::discover(Some(pid))?;
+                        // Resolve current dimensions but require the same document identity.
+                        let current = connection
+                            .canvases
+                            .iter()
+                            .find(|c| {
+                                c.address == canvas.address
+                                    && c.id == canvas.id
+                                    && c.name == canvas.name
+                            })
+                            .ok_or_else(|| tr(Key::ErrorNoCanvas).to_owned())?;
+                        PreviewImage::from_live(&connection.reader(), current, 512, 512 * 512)
+                    })(),
+                )
+            });
+        } else {
+            self.preview.loading = false;
+            self.preview.clear();
+        }
+    }
+    fn invalidate_preview(&mut self) {
+        self.preview_revision += 1;
+        self.preview.loading = false;
+        self.preview.clear();
+    }
+    fn open_session(&mut self, path: PathBuf) {
+        self.session_edited = false;
+        self.session_path = path.to_string_lossy().into_owned();
+        self.session_source = true;
+        self.stats = None;
+        self.summary = None;
+        self.session_error = None;
+        self.session_revision += 1;
+        let revision = self.session_revision;
+        self.launch(move || {
+            Message::Session(revision, Session::open(&path).and_then(|s| s.summary()))
+        });
+        self.invalidate_preview();
+        self.request_preview();
+        self.request_plan();
+        if self.output_path.is_empty() {
+            self.output_path = PathBuf::from(&self.session_path)
+                .with_extension("mp4")
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    fn set_recording_path(&mut self, path: PathBuf) {
+        self.session_edited = false;
+        self.session_path = path.to_string_lossy().into_owned();
+        self.summary = None;
+        self.stats = None;
+        self.session_error = None;
+        self.session_revision += 1;
+        let revision = self.session_revision;
+        self.launch(move || {
+            Message::RecordingPath(
+                revision,
+                (|| {
+                    if path
+                        .join("manifest.json")
+                        .try_exists()
+                        .map_err(|e| e.to_string())?
+                    {
+                        Session::open(&path)?.summary().map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                })(),
+            )
+        });
+        if self.output_path.is_empty() && !self.session_path.is_empty() {
+            self.output_path = PathBuf::from(&self.session_path)
+                .with_extension("mp4")
+                .to_string_lossy()
+                .into_owned();
+        }
+        self.request_plan();
+    }
+    fn request_plan(&mut self) {
+        self.plan_revision += 1;
+        self.plan = None;
+        self.plan_due = Some(std::time::Instant::now() + Duration::from_millis(150));
+        if !self.export_busy() {
+            self.exporting = ExportState::Planning;
+        }
+    }
+    fn launch_plan(&mut self) {
+        self.plan_due = None;
+        if self.session_path.is_empty() || self.recording_busy() || self.export_busy() {
+            if !self.export_busy() {
+                self.exporting = ExportState::Idle;
+            }
+            return;
+        }
+        self.exporting = ExportState::Planning;
+        self.plan_running = true;
+        let revision = self.plan_revision;
+        let path = PathBuf::from(&self.session_path);
+        let options = clone_options(&self.options);
+        self.launch(move || {
+            Message::Plan(
+                revision,
+                Session::open(&path).and_then(|mut s| export::plan(&mut s, &options)),
+            )
+        });
+    }
+    fn choose(&mut self, dialog: Dialog) {
+        if self.dialog_open {
+            return;
+        }
+        self.dialog_open = true;
+        let suggested_output = PathBuf::from(&self.output_path);
+        self.launch(move || {
+            let result = match dialog {
+                Dialog::OpenSession => rfd::FileDialog::new()
+                    .set_title(tr(Key::OpenSession))
+                    .pick_folder(),
+                Dialog::SessionFolder => rfd::FileDialog::new()
+                    .set_title(tr(Key::ChooseDirectory))
+                    .pick_folder(),
+                Dialog::Output => {
+                    let mut suggestion = suggested_output;
+                    loop {
+                        let mut picker = rfd::FileDialog::new()
+                            .set_title(tr(Key::ChooseOutput))
+                            .add_filter(tr(Key::Mp4), &["mp4"]);
+                        if let Some(parent) = suggestion.parent()
+                            && !parent.as_os_str().is_empty()
+                            && parent.is_dir()
+                        {
+                            picker = picker.set_directory(parent);
+                        }
+                        let name = suggestion
+                            .file_name()
+                            .filter(|name| !name.is_empty())
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "timelapse.mp4".to_owned());
+                        let Some(selected) = picker.set_file_name(name).save_file() else {
+                            break None;
+                        };
+
+                        let mut normalized = selected.clone();
+                        normalized.set_extension("mp4");
+                        if normalized == selected {
+                            break Some(normalized);
+                        }
+                        match normalized.try_exists() {
+                            Ok(false) => break Some(normalized),
+                            Ok(true) | Err(_) => suggestion = normalized,
+                        }
+                    }
+                }
+            };
+            Message::Path(dialog, result)
+        });
+    }
+    fn start(&mut self) {
+        let Some((pid, canvas)) = self
+            .detected
+            .as_ref()
+            .and_then(|d| d.canvases.get(self.selected).map(|c| (d.pid, c.clone())))
+        else {
+            return;
+        };
+        if self.session_path.trim().is_empty() {
+            let seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            self.session_path = format!("recordings/session-{seconds}");
+        }
+        if self.output_path.is_empty() {
+            self.output_path = PathBuf::from(&self.session_path)
+                .with_extension("mp4")
+                .to_string_lossy()
+                .into_owned();
+        }
+        self.recording_warnings.clear();
+        self.recording = RecordingState::Starting;
+        self.exporting = ExportState::Idle;
+        self.plan = None;
+        self.plan_revision += 1;
+        self.session_revision += 1;
+        // Invalidate in-flight thumbnails while retaining the last completed texture.
+        self.preview_revision += 1;
+        self.preview.loading = false;
+        self.session_source = false;
+        self.session_error = None;
+        self.stats = None;
+        self.stop = Arc::new(AtomicBool::new(false));
+        let stop = self.stop.clone();
+        let config = self.config.clone();
+        let dir = PathBuf::from(&self.session_path);
+        let tx = self.tx.clone();
+        self.launch(move || {
+            Message::Recorded((|| {
+                let connection = Connection::discover(Some(pid))?;
+                let current = connection
+                    .canvases
+                    .iter()
+                    .find(|c| **c == canvas)
+                    .ok_or_else(|| tr(Key::ErrorNoCanvas).to_owned())?;
+                recorder::record_cancellable(
+                    &connection.reader(),
+                    current,
+                    &dir,
+                    config,
+                    &stop,
+                    move |stats| {
+                        let _ = tx.send(Message::Stats(stats));
+                    },
+                )
+                .map(|metrics| metrics.warnings)
+            })())
+        });
+    }
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.recording = RecordingState::Stopping;
+    }
+    fn export(&mut self, output: PathBuf) {
+        self.export_warnings.clear();
+        self.exporting = ExportState::Exporting;
+        self.export_progress = (0, 0);
+        let tx = self.tx.clone();
+        let dir = PathBuf::from(&self.session_path);
+        let mut options = clone_options(&self.options);
+        // The native Save As dialog owns overwrite confirmation for GUI exports.
+        options.overwrite = true;
+        self.launch(move || {
+            Message::Exported(
+                export::run_with_progress(&dir, &output, options, move |done, total| {
+                    let _ = tx.send(Message::ExportProgress(done, total));
+                })
+                .map(|report| report.warnings),
+            )
+        });
+    }
+    fn poll(&mut self, ctx: &egui::Context) {
+        while let Ok(message) = self.rx.try_recv() {
+            match message {
+                Message::Detected(result) => {
+                    self.detecting = false;
+                    match result {
+                        Ok(d) => {
+                            let old = self
+                                .detected
+                                .as_ref()
+                                .and_then(|d| d.canvases.get(self.selected))
+                                .cloned();
+                            self.selected = old
+                                .and_then(|c| d.canvases.iter().position(|v| v == &c))
+                                .unwrap_or(0);
+                            self.detected = Some(d);
+                            self.connection_error = None;
+                        }
+                        Err(e) => {
+                            self.connection_error = Some(e);
+                            self.detected = None;
+                        }
+                    }
+                    if !self.recording_busy() && !self.session_source {
+                        self.invalidate_preview();
+                        self.request_preview();
+                    }
+                }
+                Message::Preview(revision, result) if revision == self.preview_revision => {
+                    self.preview.set(ctx, result)
+                }
+                Message::Session(revision, result) if revision == self.session_revision => {
+                    match result {
+                        Ok(summary) => {
+                            self.stats = None;
+                            self.summary = Some(summary);
+                            self.session_error = None;
+                        }
+                        Err(e) => self.session_error = Some(e),
+                    }
+                }
+                Message::Plan(revision, result) => {
+                    self.plan_running = false;
+                    if revision == self.plan_revision && !self.export_busy() {
+                        match result {
+                            Ok(plan) => {
+                                self.plan = Some(plan);
+                                self.exporting = ExportState::Idle;
+                            }
+                            Err(e) => self.exporting = ExportState::Error(e),
+                        }
+                    }
+                }
+                Message::RecordingPath(revision, result) if revision == self.session_revision => {
+                    match result {
+                        Ok(summary) => {
+                            self.session_source = summary.is_some();
+                            self.summary = summary;
+                            self.invalidate_preview();
+                            self.request_preview();
+                            if self.summary.is_none() {
+                                self.plan_revision += 1;
+                                self.plan_due = None;
+                                self.plan = None;
+                                self.exporting = ExportState::Idle;
+                            }
+                        }
+                        Err(e) => self.session_error = Some(e),
+                    }
+                }
+                Message::ExportProgress(done, total) => self.export_progress = (done, total),
+                Message::Stats(stats) => {
+                    self.stats = Some(stats);
+                    if self.recording == RecordingState::Starting {
+                        self.recording = RecordingState::Recording;
+                    }
+                }
+                Message::Recorded(result) => {
+                    self.recording = match result {
+                        Ok(warnings) => {
+                            self.recording_warnings = warnings;
+                            RecordingState::Idle
+                        }
+                        Err(e) => RecordingState::Error(e),
+                    };
+                    self.session_revision += 1;
+                    let revision = self.session_revision;
+                    let dir = PathBuf::from(&self.session_path);
+                    self.launch(move || {
+                        Message::Session(revision, Session::open(&dir).and_then(|s| s.summary()))
+                    });
+                    // Prefer the persisted final state even if SAI has closed.
+                    self.session_source = true;
+                    self.invalidate_preview();
+                    self.request_preview();
+                    self.request_plan();
+                }
+                Message::Exported(result) => {
+                    self.exporting = match result {
+                        Ok(warnings) => {
+                            self.export_warnings = warnings;
+                            ExportState::Finished
+                        }
+                        Err(e) => ExportState::Error(e),
+                    }
+                }
+                Message::Path(dialog, path) => {
+                    self.dialog_open = false;
+                    if let Some(path) = path {
+                        match dialog {
+                            Dialog::OpenSession => self.open_session(path),
+                            Dialog::SessionFolder => self.set_recording_path(path),
+                            Dialog::Output => {
+                                let mut output = path;
+                                output.set_extension("mp4");
+                                self.output_path = output.to_string_lossy().into_owned();
+                                self.export(output);
+                            }
+                        }
+                    }
+                }
+                Message::OpenError(result) => self.session_error = result.err(),
+                _ => (),
+            }
+        }
+    }
+    fn menus(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                ui.menu_button(tr(Key::File), |ui| {
+                    if ui
+                        .add_enabled(
+                            !self.recording_busy() && !self.export_busy() && !self.dialog_open,
+                            egui::Button::new(tr(Key::OpenSession)),
+                        )
+                        .clicked()
+                    {
+                        self.choose(Dialog::OpenSession);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.session_path.is_empty(),
+                            egui::Button::new(tr(Key::OpenSessionFolder)),
+                        )
+                        .clicked()
+                    {
+                        let path = PathBuf::from(&self.session_path);
+                        self.launch(move || match open::that(path) {
+                            Ok(()) => Message::OpenError(Ok(())),
+                            Err(e) => Message::OpenError(Err(e.to_string())),
+                        });
+                        ui.close();
+                    }
+                    if ui.button(tr(Key::Exit)).clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                ui.menu_button(tr(Key::View), |ui| {
+                    let before = (
+                        self.settings.theme,
+                        self.settings.font.clone(),
+                        self.settings.font_size,
+                    );
+                    self.settings.view_menu(ui, &mut self.font_window);
+                    if before
+                        != (
+                            self.settings.theme,
+                            self.settings.font.clone(),
+                            self.settings.font_size,
+                        )
+                    {
+                        self.settings.apply(ctx);
+                    }
+                });
+                ui.menu_button(tr(Key::Help), |ui| {
+                    if ui.button(tr(Key::Repository)).clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(REPOSITORY));
+                        ui.close();
+                    }
+                    if ui.button(tr(Key::About)).clicked() {
+                        self.about = true;
+                        ui.close();
+                    }
+                });
+            });
+        });
+    }
+    fn source_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(tr(Key::Sai2));
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if self.detecting {
+                ui.spinner();
+                ui.label(tr(Key::CheckingCompatibility));
+            } else if let Some(d) = &self.detected {
+                let (key, icon, color) = match d.compatibility {
+                    CompatibilityStatus::ExactKnownBuild => (
+                        Key::CompatibilityExact,
+                        Icon::Check,
+                        egui::Color32::from_rgb(55, 160, 100),
+                    ),
+                    CompatibilityStatus::SignatureValidated => (
+                        Key::CompatibilityValidated,
+                        Icon::Check,
+                        egui::Color32::from_rgb(55, 160, 100),
+                    ),
+                    CompatibilityStatus::NeedsCanvas => {
+                        (Key::NeedCanvas, Icon::Warning, ui.visuals().warn_fg_color)
+                    }
+                    _ => (
+                        Key::CompatibilityUnsupported,
+                        Icon::Warning,
+                        ui.visuals().error_fg_color,
+                    ),
+                };
+                ui.label(tr(key));
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                paint_icon(ui, icon, rect.center(), 16.0, color);
+            } else {
+                ui.label(tr(
+                    if matches!(self.connection_error, Some(ConnectionError::Unsupported(_))) {
+                        Key::CompatibilityUnsupported
+                    } else {
+                        Key::WaitingForSai
+                    },
+                ));
+            }
+        });
+        if let Some(error) = &self.connection_error
+            && !matches!(error, ConnectionError::NotFound(_))
+        {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                tr(if matches!(error, ConnectionError::Unsupported(_)) {
+                    Key::CompatibilityUnsupported
+                } else {
+                    Key::ErrorProcessAccess
+                }),
+            )
+            .on_hover_text(error.to_string());
+        }
+        ui.add_space(6.0);
+        ui.label(tr(Key::Canvas));
+        let before = self.selected;
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("canvas")
+                .width((ui.available_width() - 40.0).max(100.0))
+                .selected_text(
+                    self.detected
+                        .as_ref()
+                        .and_then(|d| d.canvases.get(self.selected))
+                        .map(canvas_label)
+                        .unwrap_or_else(|| tr(Key::SelectCanvas).into()),
+                )
+                .show_ui(ui, |ui| {
+                    if let Some(d) = &self.detected {
+                        for (i, c) in d.canvases.iter().enumerate() {
+                            ui.selectable_value(&mut self.selected, i, canvas_label(c));
+                        }
+                    }
+                });
+            if icon_button(ui, Icon::Refresh, tr(Key::TooltipRefresh), !self.detecting).clicked() {
+                self.refresh_connection();
+            }
+        });
+        if before != self.selected {
+            self.session_source = false;
+            self.invalidate_preview();
+            self.request_preview();
+        }
+        if self.session_source && ui.button(tr(Key::LiveCanvas)).clicked() {
+            self.session_source = false;
+            self.invalidate_preview();
+            self.request_preview();
+        }
+        if let Some(c) = self
+            .detected
+            .as_ref()
+            .and_then(|d| d.canvases.get(self.selected))
+        {
+            ui.weak(format_dimensions(c.width, c.height));
+        }
+    }
+    fn recording_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(tr(Key::RecordingSection));
+        ui.add_space(8.0);
+        let busy = self.recording_busy();
+        ui.add_enabled_ui(!busy && !self.export_busy() && !self.dialog_open, |ui| {
+            ui.label(tr(Key::Session));
+            ui.horizontal(|ui| {
+                let width = (ui.available_width() - 40.0).max(100.0);
+                let response = ui.add_sized(
+                    [width, ui.spacing().interact_size.y],
+                    egui::TextEdit::singleline(&mut self.session_path),
+                );
+                if response.changed() {
+                    self.session_edited = true;
+                    self.session_revision += 1;
+                    self.stats = None;
+                    self.summary = None;
+                    self.session_error = None;
+                    if self.session_source {
+                        self.invalidate_preview();
+                    }
+                    self.plan_revision += 1;
+                    self.plan = None;
+                    self.plan_due = None;
+                    self.exporting = ExportState::Idle;
+                }
+                if response.lost_focus() && self.session_edited {
+                    self.set_recording_path(PathBuf::from(&self.session_path));
+                }
+                if icon_button(
+                    ui,
+                    Icon::Folder,
+                    tr(Key::ChooseDirectory),
+                    !self.dialog_open,
+                )
+                .clicked()
+                {
+                    self.choose(Dialog::SessionFolder);
+                }
+            });
+        });
+        ui.add_space(6.0);
+        let tracked = self
+            .stats
+            .as_ref()
+            .map(|s| s.total_tracked_duration_ms)
+            .or_else(|| self.summary.as_ref().map(|s| s.tracked_duration_ms))
+            .unwrap_or(0);
+        let captures = self
+            .stats
+            .as_ref()
+            .map(|s| s.captures)
+            .or_else(|| self.summary.as_ref().map(|s| s.captures))
+            .unwrap_or(0);
+        let size = self
+            .stats
+            .as_ref()
+            .map(|s| s.disk_bytes)
+            .or_else(|| self.summary.as_ref().map(|s| s.disk_bytes))
+            .unwrap_or(0);
+        egui::Grid::new("stats")
+            .spacing([24.0, 8.0])
+            .min_col_width(100.0)
+            .show(ui, |ui| {
+                ui.weak(tr(Key::Tracked));
+                ui.label(duration(tracked / 1000 * 1000));
+                ui.end_row();
+                ui.weak(tr(Key::Captures));
+                ui.label(captures.to_string());
+                ui.end_row();
+                ui.weak(tr(Key::Size));
+                ui.label(format_size(size));
+                ui.end_row();
+            });
+        ui.add_space(10.0);
+        match &self.recording {
+            RecordingState::Idle | RecordingState::Error(_) => {
+                let enabled = !self.export_busy()
+                    && !self.dialog_open
+                    && self
+                        .detected
+                        .as_ref()
+                        .is_some_and(|d| !d.canvases.is_empty());
+                if action_button(ui, Icon::Play, tr(Key::StartRecording), enabled, false).clicked()
+                {
+                    self.start();
+                }
+            }
+            RecordingState::Starting | RecordingState::Recording => {
+                if action_button(ui, Icon::Stop, tr(Key::StopRecording), true, true).clicked() {
+                    self.stop();
+                }
+            }
+            RecordingState::Stopping => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(tr(Key::Stopping));
+                });
+            }
+        }
+        if let RecordingState::Error(e) = &self.recording {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+        }
+        for w in &self.recording_warnings {
+            ui.colored_label(ui.visuals().warn_fg_color, w);
+        }
+        if let Some(e) = &self.session_error {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+        }
+        ui.add_space(6.0);
+        ui.add_enabled_ui(!busy && !self.export_busy() && !self.dialog_open, |ui| {
+            egui::CollapsingHeader::new(tr(Key::Advanced))
+                .id_salt("record-advanced")
+                .show(ui, |ui| {
+                    field_grid(ui, "record-fields", |ui| {
+                        option_u64(
+                            ui,
+                            Key::IdleDelay,
+                            Key::IdleDelayTip,
+                            &mut self.config.idle_delay_ms,
+                            0..=60000,
+                        );
+                        option_u64(
+                            ui,
+                            Key::MinCaptureGap,
+                            Key::MinCaptureGapTip,
+                            &mut self.config.min_capture_gap_ms,
+                            1..=60000,
+                        );
+                        option_u64(
+                            ui,
+                            Key::MaxActiveGap,
+                            Key::MaxActiveGapTip,
+                            &mut self.config.max_active_gap_ms,
+                            1..=600000,
+                        );
+                        help(ui, Key::ZstdLevel, Key::ZstdLevelTip);
+                        ui.add(egui::DragValue::new(&mut self.config.zstd_level).range(-7..=22));
+                        ui.end_row();
+                        option_u64(
+                            ui,
+                            Key::CheckpointInterval,
+                            Key::CheckpointIntervalTip,
+                            &mut self.config.checkpoint_every_events,
+                            0..=100000,
+                        );
+                        help(ui, Key::CheckpointRatio, Key::CheckpointRatioTip);
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.checkpoint_changed_ratio)
+                                .range(0..=100)
+                                .suffix(tr(Key::PercentSuffix)),
+                        );
+                        ui.end_row();
+                        help(ui, Key::InputWatcher, Key::InputWatcherTip);
+                        let mut watch = !self.config.no_input_watch;
+                        ui.checkbox(&mut watch, "");
+                        self.config.no_input_watch = !watch;
+                        ui.end_row();
+                    });
+                });
+        });
+    }
+    fn export_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(tr(Key::Export));
+        ui.add_space(8.0);
+        let before = format!("{:?}", self.options);
+        ui.add_enabled_ui(
+            !self.recording_busy() && !self.export_busy() && !self.dialog_open,
+            |ui| {
+                ui.add_space(6.0);
+                field_grid(ui, "export-main", |ui| {
+                    ui.label(tr(Key::Speed));
+                    ui.add(
+                        egui::DragValue::new(&mut self.options.speed)
+                            .range(0.01..=10000.0)
+                            .speed(0.1)
+                            .suffix(tr(Key::MultiplierSuffix)),
+                    );
+                    ui.end_row();
+                    combo(
+                        ui,
+                        "quality",
+                        Key::Quality,
+                        &mut self.options.quality,
+                        &[
+                            (Quality::Draft, Key::Draft),
+                            (Quality::Balanced, Key::Balanced),
+                            (Quality::High, Key::High),
+                            (Quality::Archival, Key::Archival),
+                        ],
+                    );
+                });
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new(tr(Key::Advanced))
+                    .id_salt("export-advanced")
+                    .show(ui, |ui| {
+                        field_grid(ui, "export-fields", |ui| {
+                            ui.label(tr(Key::Fps));
+                            ui.add(egui::DragValue::new(&mut self.options.fps).range(1..=240));
+                            ui.end_row();
+                            combo(
+                                ui,
+                                "encoder",
+                                Key::Encoder,
+                                &mut self.options.encoder,
+                                &[
+                                    (Encoder::Auto, Key::Auto),
+                                    (Encoder::Nvenc, Key::Nvenc),
+                                    (Encoder::X264, Key::X264),
+                                ],
+                            );
+                            combo(
+                                ui,
+                                "resolution",
+                                Key::Resolution,
+                                &mut self.options.size,
+                                &[
+                                    (Size::Auto, Key::Auto),
+                                    (Size::P1080, Key::P1080),
+                                    (Size::P1440, Key::P1440),
+                                    (Size::P2160, Key::P2160),
+                                ],
+                            );
+                            combo(
+                                ui,
+                                "canvas-mode",
+                                Key::CanvasMode,
+                                &mut self.options.canvas_mode,
+                                &[
+                                    (CanvasMode::Max, Key::MaxCanvas),
+                                    (CanvasMode::Initial, Key::InitialCanvas),
+                                ],
+                            );
+                            ui.label(tr(Key::HoldEnd));
+                            ui.add(
+                                egui::DragValue::new(&mut self.options.hold_end)
+                                    .range(0.0..=3600.0)
+                                    .speed(0.1)
+                                    .suffix(tr(Key::SecondsSuffix)),
+                            );
+                            ui.end_row();
+                            ui.label(tr(Key::PreviewEnd));
+                            ui.add(
+                                egui::DragValue::new(&mut self.options.preview_end)
+                                    .range(0.0..=3600.0)
+                                    .speed(0.1)
+                                    .suffix(tr(Key::SecondsSuffix)),
+                            );
+                            ui.end_row();
+                            ui.label(tr(Key::SkipProvisional));
+                            ui.checkbox(&mut self.options.skip_provisional, "");
+                            ui.end_row();
+                        });
+                    });
+            },
+        );
+        if before != format!("{:?}", self.options) {
+            self.request_plan();
+        }
+        ui.add_space(8.0);
+        if let Some(plan) = &self.plan {
+            egui::Grid::new("plan")
+                .spacing([24.0, 8.0])
+                .min_col_width(100.0)
+                .show(ui, |ui| {
+                    ui.weak(tr(Key::VideoLength));
+                    ui.label(duration(plan.duration_ms));
+                    ui.end_row();
+                    ui.weak(tr(Key::Output));
+                    ui.label(format_dimensions(plan.output_width, plan.output_height));
+                    ui.end_row();
+                });
+        } else if self.exporting == ExportState::Planning {
+            ui.label(tr(Key::Planning));
+        }
+        ui.add_space(10.0);
+        let enabled = !self.recording_busy()
+            && !self.export_busy()
+            && !self.dialog_open
+            && self.plan.is_some();
+        if action_button(ui, Icon::Export, tr(Key::ExportVideo), enabled, false).clicked() {
+            self.choose(Dialog::Output);
+        }
+        for w in &self.export_warnings {
+            ui.colored_label(ui.visuals().warn_fg_color, w);
+        }
+        match &self.exporting {
+            ExportState::Exporting => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(tr(Key::Exporting));
+                });
+                let (done, total) = self.export_progress;
+                if total > 0 {
+                    ui.add(egui::ProgressBar::new(done as f32 / total as f32).show_percentage());
+                }
+            }
+            ExportState::Finished => {
+                ui.label(tr(Key::ExportComplete))
+                    .on_hover_text(&self.output_path);
+            }
+            ExportState::Error(e) => {
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
+            _ => (),
+        }
+    }
+}
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll(ctx);
+        if !self.plan_running
+            && self
+                .plan_due
+                .is_some_and(|due| std::time::Instant::now() >= due)
+        {
+            self.launch_plan();
+        }
+        if ctx.input(|i| i.viewport().close_requested())
+            && (self.recording_busy() || self.export_busy())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.closing = true;
+            if self.recording_busy() {
+                self.stop();
+            }
+        }
+        if self.closing && !self.recording_busy() && !self.export_busy() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        self.menus(ctx);
+        self.font_window.show(ctx, &mut self.settings);
+        if self.closing {
+            egui::TopBottomPanel::top("closing").show(ctx, |ui| {
+                ui.label(tr(Key::FinishingBeforeExit));
+            });
+        }
+        egui::SidePanel::left("controls")
+            .resizable(true)
+            .default_width(440.0)
+            .min_width(410.0)
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_enabled_ui(
+                        !self.recording_busy() && !self.export_busy() && !self.dialog_open,
+                        |ui| self.source_ui(ui),
+                    );
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    self.recording_ui(ui);
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    self.export_ui(ui);
+                });
+            });
+        let recording = self.recording_busy();
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.preview.show(ui, recording) {
+                self.request_preview();
+            }
+        });
+        egui::Window::new(tr(Key::AboutTitle))
+            .open(&mut self.about)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.heading(tr(Key::ApplicationName));
+                ui.label(format!(
+                    "{} {}",
+                    tr(Key::Version),
+                    env!("CARGO_PKG_VERSION")
+                ));
+                ui.label(tr(Key::AboutLicense));
+                ui.label(tr(Key::AboutDescription));
+                ui.label(tr(Key::AboutFree));
+                ui.label(tr(Key::AboutDistribution));
+                ui.hyperlink_to(tr(Key::Repository), REPOSITORY);
+            });
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.settings.save(storage);
+    }
+}
+fn clone_options(o: &Options) -> Options {
+    Options {
+        fps: o.fps,
+        speed: o.speed,
+        encoder: o.encoder,
+        quality: o.quality,
+        size: o.size,
+        canvas_mode: o.canvas_mode,
+        hold_end: o.hold_end,
+        preview_end: o.preview_end,
+        skip_provisional: o.skip_provisional,
+        overwrite: o.overwrite,
+    }
+}
+fn duration(ms: u64) -> String {
+    let seconds = ms / 1000;
+    let mut text = if seconds >= 3600 {
+        format!(
+            "{}:{:02}:{:02}",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        )
+    } else {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    };
+    if ms % 1000 != 0 {
+        text.push_str(&format!(".{:03}", ms % 1000));
+    }
+    text
+}
+fn canvas_label(c: &Canvas) -> String {
+    format_canvas(&c.name, c.width, c.height)
+}
+fn help(ui: &mut egui::Ui, label: Key, tip: Key) {
+    ui.horizontal(|ui| {
+        ui.label(tr(label));
+        ui.weak(tr(Key::QuestionMark)).on_hover_text(tr(tip));
+    });
+}
+fn field_grid(ui: &mut egui::Ui, id: &str, body: impl FnOnce(&mut egui::Ui)) {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.x = 140.0;
+        egui::Grid::new(id)
+            .num_columns(2)
+            .min_col_width(140.0)
+            .spacing([20.0, 10.0])
+            .show(ui, body);
+    });
+}
+fn option_u64(
+    ui: &mut egui::Ui,
+    label: Key,
+    tip: Key,
+    value: &mut u64,
+    range: std::ops::RangeInclusive<u64>,
+) {
+    help(ui, label, tip);
+    ui.add(egui::DragValue::new(value).range(range).suffix(
+        if matches!(
+            label,
+            Key::IdleDelay | Key::MinCaptureGap | Key::MaxActiveGap
+        ) {
+            tr(Key::MillisecondsSuffix)
+        } else {
+            ""
+        },
+    ));
+    ui.end_row();
+}
+fn combo<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: Key,
+    value: &mut T,
+    choices: &[(T, Key)],
+) {
+    if label == Key::Encoder {
+        help(ui, label, Key::EncoderTip);
+    } else {
+        ui.label(tr(label));
+    }
+    egui::ComboBox::from_id_salt(id)
+        .width(140.0)
+        .selected_text(
+            choices
+                .iter()
+                .find(|(v, _)| v == value)
+                .map(|(_, k)| tr(*k))
+                .unwrap_or_default(),
+        )
+        .show_ui(ui, |ui| {
+            for (v, key) in choices {
+                ui.selectable_value(value, *v, tr(*key));
+            }
+        });
+    ui.end_row();
+}

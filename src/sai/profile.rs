@@ -21,6 +21,7 @@ pub enum RootLocator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompatibilityStatus {
     ExactKnownBuild,
+    NeedsCanvas,
     SignatureValidated,
     Unsupported,
 }

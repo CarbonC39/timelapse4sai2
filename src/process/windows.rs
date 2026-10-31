@@ -1,5 +1,5 @@
 //! Native Windows x64 process discovery and read-only memory access.
-use super::ProcessMemory;
+use super::{DiscoveryError, ProcessMemory};
 use std::{
     ffi::OsString,
     io,
@@ -69,62 +69,70 @@ pub struct WindowsProcess {
 
 impl WindowsProcess {
     pub fn discover(pid: Option<u32>) -> Result<Self, String> {
-        let candidates = candidate_pids(pid)?;
+        Self::discover_detailed(pid).map_err(|e| e.to_string())
+    }
+
+    pub fn discover_detailed(pid: Option<u32>) -> Result<Self, DiscoveryError> {
+        let candidates = candidate_pids(pid).map_err(DiscoveryError::Other)?;
         // Decide ambiguity before opening candidates: an inaccessible instance must
         // never make us silently select a different one.
         let pid = match candidates.as_slice() {
             [] => {
-                return Err(match pid {
+                return Err(DiscoveryError::NotFound(match pid {
                     Some(pid) => format!("PID {pid} is not running sai2.exe"),
                     None => "could not find a process running sai2.exe".into(),
-                });
+                }));
             }
             [pid] => *pid,
             _ => {
-                return Err(format!(
+                return Err(DiscoveryError::Other(format!(
                     "multiple sai2.exe processes found (PIDs: {}); specify --pid PID",
                     candidates
                         .iter()
                         .map(u32::to_string)
                         .collect::<Vec<_>>()
                         .join(", ")
-                ));
+                )));
             }
         };
         // No debug privilege, write access, or all-access handle is requested.
         let raw =
             unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         let handle = OwnedHandle::new(raw).ok_or_else(|| {
-            win_error(pid, "open process for memory reading", unsafe {
+            DiscoveryError::Access(win_error(pid, "open process for memory reading", unsafe {
                 GetLastError()
-            })
+            }))
         })?;
-        let module_path = image_path(pid, handle.0)?;
+        let module_path = image_path(pid, handle.0).map_err(DiscoveryError::Access)?;
         if !module_path
             .file_name()
             .is_some_and(|n| is_sai_name(&n.encode_wide().collect::<Vec<_>>()))
         {
-            return Err(format!("PID {pid} no longer identifies sai2.exe"));
+            return Err(DiscoveryError::NotFound(format!(
+                "PID {pid} no longer identifies sai2.exe"
+            )));
         }
         let mut wow64 = 0;
         if unsafe { IsWow64Process(handle.0, &mut wow64) } == 0 {
-            return Err(win_error(pid, "query process architecture", unsafe {
-                GetLastError()
-            }));
+            return Err(DiscoveryError::Access(win_error(
+                pid,
+                "query process architecture",
+                unsafe { GetLastError() },
+            )));
         }
         if wow64 != 0 {
-            return Err(format!(
+            return Err(DiscoveryError::Other(format!(
                 "PID {pid}: 32-bit SAI2 is unsupported; expected x64 PE32+"
-            ));
+            )));
         }
-        let base_address = module_base(pid)?;
+        let base_address = module_base(pid).map_err(DiscoveryError::Other)?;
         let process = Self {
             pid,
             base_address,
             module_path,
             handle,
         };
-        process.validate_image()?;
+        process.validate_image().map_err(DiscoveryError::Other)?;
         Ok(process)
     }
 

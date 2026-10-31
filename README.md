@@ -1,6 +1,6 @@
 # timelapse4sai2
 
-Linux 原生 Rust CLI，支持以下 SAI Ver.2 64bit build；未知 MD5 明确拒绝，不猜测布局。
+Rust 核心库、命令行工具与 egui 桌面界面，支持 Linux / Windows x64。已知 SAI Ver.2 64bit build 如下；未知 Renovated build 需通过特征码与已打开画布的布局校验。
 
 | Build | MD5 | Session RVA |
 | --- | --- | --- |
@@ -17,8 +17,16 @@ cargo build --release
 cargo install --path . --locked
 ```
 
-NixOS 如未配置 Rust 工具链，可使用 `nix-shell -p cargo rustc` 后构建。
-不依赖 Windows DLL、OpenCV、显示服务器或屏幕截图；宿主通过 `process_vm_readv` 直接读取 Wine 进程。
+桌面界面（CLI 默认构建不引入 GUI 依赖）：
+
+```sh
+cargo run --release --features gui --bin timelapse4sai2-gui
+```
+
+界面直接调用 Rust 核心，提供画布选择、录制、静态预览和视频导出。视频导出仍需安装 FFmpeg；录制期间手动刷新预览不会产生捕获事件。项目采用 [AGPL-3.0-only](LICENSE)。
+
+NixOS 开发环境：先在项目目录执行 `nix-shell`，再运行上述 Cargo 命令。`shell.nix` 提供 Rust、FFmpeg、Wayland/X11 和 OpenGL 运行库；若当前开发会话遗留了不可用的 Wayland socket 且存在 X11 显示，会自动选择 X11。
+命令行与核心读取不依赖 Windows DLL、OpenCV、显示服务器或屏幕截图；宿主通过 `process_vm_readv` 直接读取 Wine 进程。
 Bottles/Flatpak 的可执行文件通过 `/proc/PID/root` 打开并校验 MD5。
 模块基址为 offset-zero、包含有效 x64 PE32+ 头的 `sai2.exe` 映射起点，不对 PE section 的文件偏移机械相减。
 

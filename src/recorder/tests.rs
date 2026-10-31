@@ -34,6 +34,31 @@ fn manifest() -> Manifest {
     }
 }
 
+#[test]
+fn cancellable_recording_drains_initial_capture_and_reports_final_stats() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    let mem = fixture::fixture();
+    let (reader, canvas) = fixture_reader(&mem);
+    let path = dir("cancel");
+    let cancel = Arc::new(AtomicBool::new(true));
+    let (tx, rx) = mpsc::channel();
+    let config = Config {
+        no_input_watch: true,
+        ..Config::default()
+    };
+    let metrics = record_cancellable(&reader, &canvas, &path, config, &cancel, move |s| {
+        let _ = tx.send(s);
+    })
+    .unwrap();
+    assert_eq!(metrics.logical_frames, 1);
+    assert!(
+        rx.try_iter()
+            .last()
+            .is_some_and(|s| s.captures == 1 && s.disk_bytes > 0)
+    );
+    fs::remove_dir_all(path).unwrap();
+}
+
 fn fixture_reader(
     mem: &fixture::FakeMemory,
 ) -> (Reader<'_, fixture::FakeMemory>, crate::sai::canvas::Canvas) {

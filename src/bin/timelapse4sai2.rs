@@ -1,5 +1,5 @@
-use timelapse4sai2::{export, image, process, recorder, sai};
 use std::path::Path;
+use timelapse4sai2::{connection, export, image, recorder};
 
 fn run() -> Result<(), String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -28,29 +28,54 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     if args.first().map(String::as_str) == Some("info") {
-        if args.len() != 2 { return Err("usage: timelapse4sai2 info SESSION_DIR".into()); }
+        if args.len() != 2 {
+            return Err("usage: timelapse4sai2 info SESSION_DIR".into());
+        }
         let session = recorder::storage::Session::open(Path::new(&args[1]))?;
         let summary = session.summary()?;
-        for warning in &session.warnings { eprintln!("Warning: {warning}"); }
+        for warning in &session.warnings {
+            eprintln!("Warning: {warning}");
+        }
         let seconds = summary.tracked_duration_ms / 1000;
         println!("Canvas: {}", summary.canvas_name);
-        println!("Tracked: {}h {}m {}s", seconds / 3600, seconds / 60 % 60, seconds % 60);
-        println!("Captures: {}\n  Stable: {}\n  Provisional: {}", summary.captures, summary.stable_captures, summary.provisional_captures);
+        println!(
+            "Tracked: {}h {}m {}s",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        );
+        println!(
+            "Captures: {}\n  Stable: {}\n  Provisional: {}",
+            summary.captures, summary.stable_captures, summary.provisional_captures
+        );
         println!("Size: {:.2} GiB", summary.disk_bytes as f64 / 1073741824.0);
-        println!("Dimensions: {}x{}", summary.current_width, summary.current_height);
+        println!(
+            "Dimensions: {}x{}",
+            summary.current_width, summary.current_height
+        );
         return Ok(());
     }
     if args.first().map(String::as_str) == Some("verify") {
         if args.len() == 2 {
             let report = recorder::storage::verify(Path::new(&args[1]))?;
-            for warning in &report.warnings { eprintln!("Warning: {warning}"); }
+            for warning in &report.warnings {
+                eprintln!("Warning: {warning}");
+            }
             let summary = report.summary;
-            println!("Verified: {} captures ({} stable, {} provisional), {} unique blobs", summary.captures, summary.stable_captures, summary.provisional_captures, summary.unique_blobs);
+            println!(
+                "Verified: {} captures ({} stable, {} provisional), {} unique blobs",
+                summary.captures,
+                summary.stable_captures,
+                summary.provisional_captures,
+                summary.unique_blobs
+            );
             return Ok(());
         }
         if args.len() == 4 && args[2] == "--dump-final" {
             let report = recorder::storage::verify(Path::new(&args[1]))?;
-            for warning in &report.warnings { eprintln!("Warning: {warning}"); }
+            for warning in &report.warnings {
+                eprintln!("Warning: {warning}");
+            }
             return export::dump_final(Path::new(&args[1]), Path::new(&args[3]));
         }
         return Err("usage: timelapse4sai2 verify SESSION_DIR [--dump-final FILE.png]".into());
@@ -61,8 +86,13 @@ fn run() -> Result<(), String> {
         }
         let options = export::Options::parse(&args[3..])?;
         let report = export::run(Path::new(&args[1]), Path::new(&args[2]), options)?;
-        for warning in &report.warnings { eprintln!("Warning: {warning}"); }
-        println!("Exported {} video frames to {}", report.plan.output_video_frames, args[2]);
+        for warning in &report.warnings {
+            eprintln!("Warning: {warning}");
+        }
+        println!(
+            "Exported {} video frames to {}",
+            report.plan.output_video_frames, args[2]
+        );
         return Ok(());
     }
     let mut pid = None;
@@ -97,45 +127,13 @@ fn run() -> Result<(), String> {
         Some("record") if args.len() >= 3 => { recorder::Config::parse(&args[3..])?; },
         _ => return Err("usage: timelapse4sai2 [--pid PID] detect|canvases|dump INDEX FILE|record INDEX SESSION_DIR [OPTIONS] [--channel-order bgra|rgba]".into()),
     }
-    let process = process::discover(pid)?;
-    let hash = process::executable_hash(&process)?;
-    use sai::profile::{CompatibilityStatus, RootLocator};
-    let unsupported = |reason: String| format!("{:?}: {reason}", CompatibilityStatus::Unsupported);
-    let (profile, status, resolved_root_rva) = match sai::profile::identify(&hash) {
-        Ok(profile) => (profile, CompatibilityStatus::ExactKnownBuild, None),
-        Err(_) => {
-            let profile = &sai::builds::renovated_2026_10_19::SIGNATURE_PROFILE;
-            let RootLocator::Signature(signatures) = profile.locator else {
-                unreachable!();
-            };
-            let image = std::fs::read(process.executable_path()).map_err(|e| {
-                unsupported(format!("cannot read executable for signature scan: {e}"))
-            })?;
-            if format!("{:x}", md5::compute(&image)) != hash {
-                return Err(unsupported(
-                    "executable changed during signature scan".into(),
-                ));
-            }
-            let rva = sai::signature::resolve_signatures(signatures, &image)
-                .map_err(|e| unsupported(format!("Renovated signature scan failed: {e}")))?;
-            (profile, CompatibilityStatus::SignatureValidated, Some(rva))
-        }
-    };
-    let reader = sai::reader::Reader {
-        memory: &process,
-        base: process.base_address,
-        profile,
-        resolved_root_rva,
-        source_hash: Some(&hash),
-    };
-    let validated_canvases =
-        if status == CompatibilityStatus::SignatureValidated {
-            Some(reader.validate_runtime_layout().map_err(|e| {
-                unsupported(format!("Renovated runtime layout validation failed: {e}"))
-            })?)
-        } else {
-            None
-        };
+    let connection = connection::Connection::discover(pid)?;
+    let reader = connection.reader();
+    let process = &connection.process;
+    let profile = connection.profile;
+    let hash = &connection.executable_md5;
+    let status = connection.compatibility;
+    let resolved_root_rva = connection.resolved_root_rva;
     if args[0] == "detect" {
         println!("Found sai2.exe (PID: {})", process.pid);
         println!("Module base: {:#x}", process.base_address);
@@ -151,10 +149,10 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
-    let canvases = match validated_canvases {
-        Some(canvases) => canvases,
-        None => reader.canvases()?,
-    };
+    if status == timelapse4sai2::sai::profile::CompatibilityStatus::NeedsCanvas {
+        return Err("NeedsCanvas: open a canvas in SAI2 to validate this Renovated build".into());
+    }
+    let canvases = connection.canvases();
     if args[0] == "canvases" {
         for (i, c) in canvases.iter().enumerate() {
             println!(
@@ -170,15 +168,23 @@ fn run() -> Result<(), String> {
             .get(index)
             .ok_or("canvas index out of range; run canvases again")?;
         if args[0] == "record" {
-            eprintln!("Recording {} to {}; Ctrl-C stops and drains storage.", c.name, args[2]);
+            eprintln!(
+                "Recording {} to {}; Ctrl-C stops and drains storage.",
+                c.name, args[2]
+            );
             let metrics = recorder::record(
                 &reader,
                 c,
                 Path::new(&args[2]),
                 recorder::Config::parse(&args[3..])?,
             )?;
-            for warning in &metrics.warnings { eprintln!("Warning: {warning}"); }
-            eprintln!("Captures: {} ({} provisional)", metrics.logical_frames, metrics.provisional_frames);
+            for warning in &metrics.warnings {
+                eprintln!("Warning: {warning}");
+            }
+            eprintln!(
+                "Captures: {} ({} provisional)",
+                metrics.logical_frames, metrics.provisional_frames
+            );
             return Ok(());
         }
         let rgb = reader.composite(c, rgba)?;

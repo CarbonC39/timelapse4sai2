@@ -3,14 +3,18 @@ mod ffmpeg;
 mod frame_map;
 mod replay;
 
+use crate::recorder::storage::{Event, Session, Transform};
+use ffmpeg::VideoWriter;
 pub use ffmpeg::{Encoder, Quality};
+use frame_map::FrameSchedule;
 pub use frame_map::Target;
 pub use replay::{CanvasMode, Size};
-use crate::recorder::storage::{Event, Session, Transform};
-use frame_map::FrameSchedule;
-use ffmpeg::VideoWriter;
 use replay::{Replay, Spatial};
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::BTreeSet,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 pub const HELP: &str = "timelapse4sai2 export SESSION_DIR OUTPUT.mp4 [OPTIONS]
   --fps 30                    Output FPS (1..240); does not change drawing speed
@@ -280,10 +284,16 @@ fn frames_to_ms(frames: u64, fps: u32) -> u64 {
 fn prepare(session: &mut Session, options: &Options) -> Result<Prepared, String> {
     let scan = scan(session, options.skip_provisional)?;
     if scan.states.is_empty() {
-        return Err("session has no visual states after filtering; try including provisional states".into());
+        return Err(
+            "session has no visual states after filtering; try including provisional states".into(),
+        );
     }
     let schedule = FrameSchedule::new(
-        scan.states.clone(), options.fps, options.speed, options.hold_end, options.preview_end,
+        scan.states.clone(),
+        options.fps,
+        options.speed,
+        options.hold_end,
+        options.preview_end,
     )?;
     let (logical_width, logical_height) = match options.canvas_mode {
         CanvasMode::Max => (scan.max_width, scan.max_height),
@@ -312,7 +322,12 @@ fn prepare(session: &mut Session, options: &Options) -> Result<Prepared, String>
         preview_end_ms: frames_to_ms(schedule.preview_frames(), options.fps),
         hold_end_ms: frames_to_ms(schedule.hold_frames(), options.fps),
     };
-    Ok(Prepared { plan, scan, schedule, spatial })
+    Ok(Prepared {
+        plan,
+        scan,
+        schedule,
+        spatial,
+    })
 }
 
 pub fn plan(session: &mut Session, options: &Options) -> Result<ExportPlan, String> {
@@ -345,6 +360,13 @@ fn final_replay(session: &mut Session, scan: &Scan) -> Result<Replay, String> {
     Ok(replay)
 }
 
+/// Replay the final visual state of a session. Intended for embedders that need
+/// a final thumbnail without invoking the video exporter.
+pub fn replay_final(session: &mut Session) -> Result<replay::Replay, String> {
+    let scan = scan(session, false)?;
+    final_replay(session, &scan)
+}
+
 pub fn dump_final(dir: &Path, output: &Path) -> Result<(), String> {
     let mut session = Session::open(dir)?;
     let scan = scan(&mut session, false)?;
@@ -354,6 +376,17 @@ pub fn dump_final(dir: &Path, output: &Path) -> Result<(), String> {
 }
 
 pub fn run(dir: &Path, output: &Path, options: Options) -> Result<ExportReport, String> {
+    run_with_progress(dir, output, options, |_, _| {})
+}
+
+/// Export while reporting encoded video frame progress. The callback is called
+/// at start, at most every 100ms while encoding, and at completion.
+pub fn run_with_progress(
+    dir: &Path,
+    output: &Path,
+    options: Options,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<ExportReport, String> {
     if !output
         .extension()
         .is_some_and(|s| s.eq_ignore_ascii_case("mp4"))
@@ -370,7 +403,16 @@ pub fn run(dir: &Path, output: &Path, options: Options) -> Result<ExportReport, 
     let prepared = prepare(&mut session, &options)?;
     let warnings = session.warnings.clone();
     let encoder = ffmpeg::select_encoder(options.encoder)?;
-    let Prepared { plan, scan: scanned, schedule, spatial } = prepared;
+    let Prepared {
+        plan,
+        scan: scanned,
+        schedule,
+        spatial,
+    } = prepared;
+    let total = plan.output_video_frames;
+    let mut completed = 0u64;
+    let mut last_progress = Instant::now();
+    progress(completed, total);
     let mut final_frame = None;
     if options.preview_end > 0.0 {
         let final_state = final_replay(&mut session, &scanned)?;
@@ -420,6 +462,11 @@ pub fn run(dir: &Path, output: &Path, options: Options) -> Result<ExportReport, 
             cached.as_ref()
         };
         writer.write_frame(pixels.ok_or("missing rendered frame")?)?;
+        completed += 1;
+        if last_progress.elapsed() >= Duration::from_millis(100) || completed == total {
+            progress(completed, total);
+            last_progress = Instant::now();
+        }
         previous = Some(target);
     }
     writer.finish()?;

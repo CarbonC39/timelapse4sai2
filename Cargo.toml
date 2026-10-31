@@ -1,10 +1,28 @@
 [package]
 name = "timelapse4sai2"
 version = "0.1.0"
+license = "AGPL-3.0-only"
 edition = "2024"
 rust-version = "1.89"
+default-run = "timelapse4sai2"
+
+[[bin]]
+name = "timelapse4sai2"
+path = "src/bin/timelapse4sai2.rs"
+
+[[bin]]
+name = "timelapse4sai2-gui"
+path = "src/bin/timelapse4sai2-gui.rs"
+required-features = ["gui"]
+
+[features]
+gui = ["dep:eframe", "dep:fontdb", "dep:rfd", "dep:open", "dep:winit"]
 
 [dependencies]
+eframe = { version = "0.33", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland", "persistence"] }
+fontdb = { version = "0.23", optional = true }
+rfd = { version = "0.15", optional = true }
+open = { version = "5", optional = true }
 md5 = "0.7"
 png = "0.17"
 serde = { version = "1", features = ["derive"] }
@@ -15,6 +33,7 @@ zstd = "0.13"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+winit = { version = "0.30", optional = true, default-features = false, features = ["wayland-csd-adwaita"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [

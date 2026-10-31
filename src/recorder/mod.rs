@@ -243,7 +243,35 @@ pub fn record<M: ProcessMemory>(
 
 /// The observer receives a snapshot at most four times per second on the storage thread.
 pub fn record_with_status<M: ProcessMemory>(
-    reader: &Reader<M>, canvas: &Canvas, dir: &Path, config: Config,
+    reader: &Reader<M>,
+    canvas: &Canvas,
+    dir: &Path,
+    config: Config,
+    observer: impl FnMut(storage::RecordingStats) + Send + 'static,
+) -> Result<Metrics, String> {
+    record_inner(reader, canvas, dir, config, &STOP, true, observer)
+}
+
+/// Record until `cancel` is set. This entry point does not install or modify the
+/// process-wide Ctrl-C handler and is suitable for embedding in a GUI.
+pub fn record_cancellable<M: ProcessMemory>(
+    reader: &Reader<M>,
+    canvas: &Canvas,
+    dir: &Path,
+    config: Config,
+    cancel: &AtomicBool,
+    observer: impl FnMut(storage::RecordingStats) + Send + 'static,
+) -> Result<Metrics, String> {
+    record_inner(reader, canvas, dir, config, cancel, false, observer)
+}
+
+fn record_inner<M: ProcessMemory>(
+    reader: &Reader<M>,
+    canvas: &Canvas,
+    dir: &Path,
+    config: Config,
+    cancel: &AtomicBool,
+    use_signal: bool,
     mut observer: impl FnMut(storage::RecordingStats) + Send + 'static,
 ) -> Result<Metrics, String> {
     let mut input = if config.no_input_watch {
@@ -253,8 +281,10 @@ pub fn record_with_status<M: ProcessMemory>(
     };
     let manifest = recording_manifest(reader, canvas);
     let mut store = Store::open(dir, manifest, config.clone())?;
-    STOP.store(false, Ordering::Relaxed);
-    crate::process::install_stop_handler(&STOP)?;
+    if use_signal {
+        STOP.store(false, Ordering::Relaxed);
+        crate::process::install_stop_handler(&STOP)?;
+    }
     let (tx, rx) = sync_channel(2);
     let (recycle_tx, recycle_rx) = sync_channel(4);
     store.start_recording()?;
@@ -309,7 +339,7 @@ pub fn record_with_status<M: ProcessMemory>(
         capture.capture(reader, canvas, FrameKind::Stable, &tx, &mut metrics)?;
         scheduler.captured(start.elapsed().as_millis() as u64, FrameKind::Stable);
         let mut failures = 0;
-        while !STOP.load(Ordering::Relaxed) {
+        while !cancel.load(Ordering::Relaxed) {
             let now = start.elapsed().as_millis() as u64;
             if let Some(input) = input.as_mut() {
                 if input.poll_activity(now)? {

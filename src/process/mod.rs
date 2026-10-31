@@ -4,13 +4,13 @@
 mod linux;
 
 #[cfg(target_os = "linux")]
-use linux::LinuxProcess as Process;
+pub use linux::LinuxProcess as Process;
 #[cfg(target_os = "linux")]
 pub use linux::sync_directory;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-use windows::WindowsProcess as Process;
+pub use windows::WindowsProcess as Process;
 #[cfg(target_os = "windows")]
 pub use windows::sync_directory;
 
@@ -36,8 +36,28 @@ mod signals;
 mod signals;
 pub use signals::install_stop_handler;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveryError {
+    NotFound(String),
+    Access(String),
+    Other(String),
+}
+
+impl std::fmt::Display for DiscoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(s) | Self::Access(s) | Self::Other(s) => f.write_str(s),
+        }
+    }
+}
+
 pub fn discover(pid: Option<u32>) -> Result<Process, String> {
     Process::discover(pid)
+}
+
+/// Discover SAI while preserving whether it was absent or inaccessible.
+pub fn discover_detailed(pid: Option<u32>) -> Result<Process, DiscoveryError> {
+    Process::discover_detailed(pid)
 }
 
 /// Hash the on-disk executable, using the backend's filesystem namespace.

@@ -1,4 +1,4 @@
-use super::ProcessMemory;
+use super::{DiscoveryError, ProcessMemory};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -35,12 +35,19 @@ impl LinuxProcess {
     /// identifies it as sai2.exe. If `pid` is supplied, only that process is
     /// considered.
     pub fn discover(pid: Option<u32>) -> Result<Self, String> {
+        Self::discover_detailed(pid).map_err(|e| e.to_string())
+    }
+
+    pub fn discover_detailed(pid: Option<u32>) -> Result<Self, DiscoveryError> {
         let pids: Vec<u32> = if let Some(pid) = pid {
             vec![pid]
         } else {
             let mut found = Vec::new();
-            for entry in fs::read_dir("/proc").map_err(|e| format!("cannot read /proc: {e}"))? {
-                let entry = entry.map_err(|e| format!("cannot enumerate /proc: {e}"))?;
+            for entry in fs::read_dir("/proc")
+                .map_err(|e| DiscoveryError::Access(format!("cannot read /proc: {e}")))?
+            {
+                let entry = entry
+                    .map_err(|e| DiscoveryError::Access(format!("cannot enumerate /proc: {e}")))?;
                 if let Some(name) = entry.file_name().to_str() {
                     if let Ok(n) = name.parse::<u32>() {
                         found.push(n);
@@ -52,33 +59,38 @@ impl LinuxProcess {
 
         let mut matches = Vec::new();
         for candidate_pid in pids {
-            if let Some(process) = Self::inspect(candidate_pid)? {
+            if let Some(process) = Self::inspect(candidate_pid, pid.is_some())? {
                 matches.push(process);
             }
         }
         match matches.len() {
-            0 => Err(match pid {
+            0 => Err(DiscoveryError::NotFound(match pid {
                 Some(pid) => format!("PID {pid} is not a readable process running sai2.exe"),
                 None => "could not find a readable process running sai2.exe".into(),
-            }),
+            })),
             1 => Ok(matches.remove(0)),
-            _ => Err(format!(
+            _ => Err(DiscoveryError::Other(format!(
                 "multiple sai2.exe processes found (PIDs: {}); specify a PID",
                 matches
                     .iter()
                     .map(|p| p.pid.to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
-            )),
+            ))),
         }
     }
 
-    fn inspect(pid: u32) -> Result<Option<Self>, String> {
+    fn inspect(pid: u32, report_access: bool) -> Result<Option<Self>, DiscoveryError> {
         let root = PathBuf::from(format!("/proc/{pid}"));
         let cmdline = fs::read(root.join("cmdline")).ok();
         let comm = fs::read(root.join("comm")).ok();
         let maps_text = match fs::read_to_string(root.join("maps")) {
             Ok(v) => v,
+            Err(e) if report_access && e.kind() == io::ErrorKind::PermissionDenied => {
+                return Err(DiscoveryError::Access(format!(
+                    "cannot read process maps for PID {pid}: {e}"
+                )));
+            }
             Err(_) => return Ok(None), // process exited or procfs access denied
         };
         let maps = parse_maps(&maps_text);
@@ -98,7 +110,9 @@ impl LinuxProcess {
         for region in &image_maps {
             // The PE header starts at file offset zero. Do not derive an image
             // base by subtracting a maps file offset from an arbitrary segment.
-            if region.offset == 0 && region.readable && valid_pe_headers(pid, &maps, region.start)?
+            if region.offset == 0
+                && region.readable
+                && valid_pe_headers(pid, &maps, region.start).map_err(DiscoveryError::Other)?
             {
                 bases.push(region.start);
             }
@@ -106,9 +120,9 @@ impl LinuxProcess {
         bases.sort_unstable();
         bases.dedup();
         if bases.len() != 1 {
-            return Err(format!(
+            return Err(DiscoveryError::Other(format!(
                 "could not identify a unique valid PE header mapping for sai2.exe in PID {pid}"
-            ));
+            )));
         }
         let module_path = image_maps
             .iter()
