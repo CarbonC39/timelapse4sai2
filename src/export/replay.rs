@@ -276,28 +276,46 @@ impl CanvasMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Size {
     Auto,
+    P720,
     P1080,
     P1440,
     P2160,
+    /// Percentage of the logical canvas's longest edge, before the encoder cap.
+    Percent(u32),
 }
 impl Size {
     pub fn parse(v: &str) -> Result<Self, String> {
-        match v.to_ascii_lowercase().as_str() {
+        let lower = v.to_ascii_lowercase();
+        if let Some(percent) = lower.strip_suffix('%') {
+            let percent = percent
+                .parse::<u32>()
+                .ok()
+                .filter(|percent| (1..=400).contains(percent))
+                .ok_or_else(|| format!("invalid output size percentage '{v}'"))?;
+            return Ok(Self::Percent(percent));
+        }
+        match lower.as_str() {
             "auto" => Ok(Self::Auto),
+            "720" | "720p" => Ok(Self::P720),
             "1080" | "1080p" => Ok(Self::P1080),
             "1440" | "1440p" => Ok(Self::P1440),
             "2160" | "2160p" => Ok(Self::P2160),
             _ => Err(format!(
-                "unknown output size '{v}' (expected auto, 1080, 1440, or 2160)"
+                "unknown output size '{v}' (expected auto, 720, 1080, 1440, 2160, or N%)"
             )),
         }
     }
-    fn edge(self) -> Option<u32> {
+    fn edge(self, logical_max: u32) -> Option<u32> {
         match self {
             Self::Auto => None,
+            Self::P720 => Some(720),
             Self::P1080 => Some(1080),
             Self::P1440 => Some(1440),
             Self::P2160 => Some(2160),
+            Self::Percent(percent) => {
+                let edge = logical_max as u64 * percent as u64;
+                Some((edge.div_ceil(100)).min(u32::MAX as u64) as u32)
+            }
         }
     }
 }
@@ -329,8 +347,14 @@ impl Spatial {
         if max_dimension < 2 {
             return Err("maximum encoder dimension must be at least 2".into());
         }
-        let cap = size.edge().unwrap_or(max_dimension).min(max_dimension) & !1;
-        let scale = (cap as f64 / logical_width.max(logical_height) as f64)
+        let logical_max = logical_width.max(logical_height);
+        let cap = size
+            .edge(logical_max)
+            .unwrap_or(max_dimension)
+            .min(max_dimension)
+            .max(2)
+            & !1;
+        let scale = (cap as f64 / logical_max as f64)
             .min(if size == Size::Auto { 1.0 } else { f64::MAX });
         let w = ((logical_width as f64 * scale).round() as u32).max(1);
         let h = ((logical_height as f64 * scale).round() as u32).max(1);
@@ -480,6 +504,14 @@ mod tests {
         let result = spatial.render(&input, 3, 2).unwrap();
         assert_eq!(&result[0..9], &[7; 9]);
         assert_eq!(&result[9..12], &[128; 3]);
+    }
+
+    #[test]
+    fn spatial_percent_scales_from_logical_canvas() {
+        let half = Spatial::new(400, 200, Size::Percent(50), 4096).unwrap();
+        assert_eq!((half.width, half.height), (200, 100));
+        let capped = Spatial::new(4000, 2000, Size::Percent(50), 1000).unwrap();
+        assert_eq!((capped.width, capped.height), (1000, 500));
     }
 
     #[test]

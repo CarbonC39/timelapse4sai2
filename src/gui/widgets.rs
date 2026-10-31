@@ -339,7 +339,7 @@ pub fn action_button(
     response
 }
 
-pub fn path_edit(ui: &mut egui::Ui, value: &mut String, width: f32) -> Response {
+pub fn path_edit(ui: &mut egui::Ui, value: &mut String, width: f32, hint: &str) -> Response {
     ui.scope(|ui| {
         let background = if ui.visuals().dark_mode {
             Color32::from_rgb(35, 38, 42)
@@ -356,7 +356,7 @@ pub fn path_edit(ui: &mut egui::Ui, value: &mut String, width: f32) -> Response 
         ui.visuals_mut().widgets.hovered.bg_stroke.color = border;
         ui.add_sized(
             Vec2::new(width.max(0.0), ui.spacing().interact_size.y.max(28.0)),
-            egui::TextEdit::singleline(value),
+            egui::TextEdit::singleline(value).hint_text(hint),
         )
     })
     .inner

@@ -128,7 +128,7 @@ blob 索引内存随 unique blobs 增长；存储慢会拉长候选间隔，不�
 ```
 
 默认 `30fps / 1x / auto encoder / balanced quality / auto size / max canvas`，
-包含 Stable 和 Provisional 状态，末尾定格 3 秒。`--help` 列出全部参数。
+包含 Stable 和 Provisional 状态，开头预览 3 秒、末尾定格 3 秒。`--help` 列出全部参数。
 Session 是有序视觉状态而非实时录屏，忽略 timestamp 和 idle 时间：
 `1x` 每秒推进 30 个状态，`--speed` 调节绘画播放倍率，`--fps` 只调节输出帧率。
 加速均匀跳过状态，减速重复状态；`--skip-provisional` 仅选 Stable，
@@ -137,8 +137,9 @@ Session 是有序视觉状态而非实时录屏，忽略 timestamp 和 idle 时�
 
 `--canvas-mode max` 先以历史最大宽高统一逻辑画布，小画布居中补灰边，原图不缩放；
 resize origin 未知时居中放置。`initial` 固定初始尺寸，后续较大画布居中裁剪。
-再由 `--size 1080|1440|2160` 将**最长边**等比缩放到指定像素数；
-`auto` 保留自然尺寸、不主动放大，仅在超出编码器保守上限时缩小（NVENC 4096、x264 8192）。
+再由 `--size 720|1080|1440|2160` 将**最长边**等比缩放到指定像素数，
+或使用 `75%`、`50%` 之类的画布比例；`auto` 保留自然尺寸、不主动放大，
+仅在超出编码器保守上限时缩小（NVENC 4096、x264 8192）。
 最终奇数宽高在右/下补 1px 灰边，输出 H.264 MP4 / yuv420p。
 
 `--encoder auto` 实际试编码探测 NVENC 初始化能力，不可用时提示并回退 x264；

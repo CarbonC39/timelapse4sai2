@@ -806,7 +806,12 @@ impl App {
         ui.add_enabled_ui(editable, |ui| {
             form_row(ui, i18n, Key::Session, None, |ui| {
                 let width = (ui.available_width() - 28.0 - ui.spacing().item_spacing.x).max(0.0);
-                let response = path_edit(ui, &mut self.session_path, width);
+                let response = path_edit(
+                    ui,
+                    &mut self.session_path,
+                    width,
+                    i18n.tr(Key::SessionHint),
+                );
                 if response.changed() {
                     self.session_edited = true;
                     self.open_request = None;
@@ -1153,9 +1158,13 @@ impl App {
             &mut self.options.size,
             &[
                 (Size::Auto, Key::Auto),
-                (Size::P1080, Key::P1080),
-                (Size::P1440, Key::P1440),
+                (Size::Percent(75), Key::P75),
+                (Size::Percent(50), Key::P50),
+                (Size::Percent(25), Key::P25),
                 (Size::P2160, Key::P2160),
+                (Size::P1440, Key::P1440),
+                (Size::P1080, Key::P1080),
+                (Size::P720, Key::P720),
             ],
         );
         combo(
@@ -1522,7 +1531,10 @@ mod tests {
     use super::*;
     #[test]
     fn gui_exports_skip_provisional_captures_by_default() {
-        assert!(gui_options().skip_provisional);
+        let options = gui_options();
+        assert!(options.skip_provisional);
+        assert_eq!(options.preview_end, 3.0);
+        assert_eq!(options.hold_end, 3.0);
     }
     #[test]
     fn recent_session_labels_use_the_directory_basename() {
@@ -1568,7 +1580,7 @@ mod tests {
                                 .show_ui(ui, |_| {});
                             form_row(ui, i18n, Key::Session, None, |ui| {
                                 let width = (ui.available_width() - 36.0).max(0.0);
-                                path_edit(ui, &mut path, width);
+                                path_edit(ui, &mut path, width, "");
                                 icon_button(
                                     ui,
                                     Icon::Folder,

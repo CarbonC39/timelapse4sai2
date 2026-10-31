@@ -21,13 +21,15 @@ pub const HELP: &str = "timelapse4sai2 export SESSION_DIR OUTPUT.mp4 [OPTIONS]
   --speed 1.0                 Drawing playback multiplier; 1x = 30 visual states/s
   --encoder auto|nvenc|x264    Default auto; probes NVENC, falls back to libx264
   --quality draft|balanced|high|archival  Default balanced
-  --size auto|1080|1440|2160   Longest edge in pixels; auto keeps natural size,
-                              capped to encoder limits; aspect ratio preserved
+  --size auto|720|1080|1440|2160|N%
+                              Longest edge in pixels, or percentage of the
+                              logical canvas; auto keeps natural size, capped
+                              to encoder limits; aspect ratio preserved
   --canvas-mode max|initial   Default max: center on historical maximum canvas;
                               initial: center-crop to initial canvas. No scaling
                               during placement; unknown resize origin is centered
   --hold-end 3                Final artwork hold in seconds (0 disables)
-  --preview-end 0             Final artwork preview before drawing, in seconds
+  --preview-end 3             Final artwork preview before drawing, in seconds
   --skip-provisional          Only stable states (default includes provisional)
   --overwrite                 Replace existing output only after encoding succeeds
 Timestamps and idle time are ignored. Durations round to the nearest output frame.
@@ -83,7 +85,7 @@ impl Default for Options {
             size: Size::Auto,
             canvas_mode: CanvasMode::Max,
             hold_end: 3.0,
-            preview_end: 0.0,
+            preview_end: 3.0,
             skip_provisional: false,
             overwrite: false,
         }
@@ -512,12 +514,17 @@ mod tests {
             )
         );
         assert!(o.overwrite && o.skip_provisional);
+        assert_eq!(Size::parse("50%").unwrap(), Size::Percent(50));
+        assert_eq!(Size::parse("720p").unwrap(), Size::P720);
         for args in [
             vec!["--speed", "NaN"],
             vec!["--hold-end", "-1"],
             vec!["--fps", "0"],
             vec!["--encoder", "other"],
             vec!["--size", "1280"],
+            vec!["--size", "0%"],
+            vec!["--size", "500%"],
+            vec!["--size", "half"],
             vec!["--speed"],
             vec!["--extra"],
         ] {
