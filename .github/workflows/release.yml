@@ -32,13 +32,15 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          name="timelapse4sai2-$TAG-linux-x64"
-          mkdir -p "dist/$name"
-          install -m 755 target/release/timelapse4sai2 "dist/$name/"
-          install -m 755 target/release/timelapse4sai2-gui "dist/$name/"
-          cp README.md LICENSE shell.nix "dist/$name/"
-          cp docs/recording-format.md "dist/$name/"
-          tar -C dist -czf "$name.tar.gz" "$name"
+          for edition in gui cli; do
+            name="timelapse4sai2-$TAG-linux-x64-$edition"
+            binary="timelapse4sai2"
+            if [ "$edition" = gui ]; then binary="timelapse4sai2-gui"; fi
+            mkdir -p "dist/$name"
+            install -m 755 "target/release/$binary" "dist/$name/"
+            cp README.md LICENSE shell.nix "dist/$name/"
+            tar -C dist -czf "$name.tar.gz" "$name"
+          done
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -46,12 +48,14 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           $ErrorActionPreference = "Stop"
-          $name = "timelapse4sai2-$env:TAG-windows-x64"
-          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
-          Copy-Item target/release/timelapse4sai2.exe "dist/$name/"
-          Copy-Item target/release/timelapse4sai2-gui.exe "dist/$name/"
-          Copy-Item README.md, LICENSE, docs/recording-format.md "dist/$name/"
-          Compress-Archive -Path "dist/$name" -DestinationPath "$name.zip" -Force
+          foreach ($edition in @("gui", "cli")) {
+            $name = "timelapse4sai2-$env:TAG-windows-x64-$edition"
+            $binary = if ($edition -eq "gui") { "timelapse4sai2-gui.exe" } else { "timelapse4sai2.exe" }
+            New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+            Copy-Item "target/release/$binary" "dist/$name/"
+            Copy-Item README.md, LICENSE "dist/$name/"
+            Compress-Archive -Path "dist/$name" -DestinationPath "$name.zip" -Force
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}

@@ -32,7 +32,7 @@ pub struct Settings {
     /// Global base size in points. All egui text styles are derived from it.
     pub font_size: f32,
     /// Defaults keep settings written by older GUI builds readable.
-    #[serde(default)]
+    #[serde(default = "super::locale::system_language")]
     pub language: Language,
     #[serde(default)]
     pub recent_sessions: Vec<PathBuf>,
@@ -45,7 +45,7 @@ impl Default for Settings {
             theme: Theme::System,
             font: None,
             font_size: 14.5,
-            language: Language::English,
+            language: super::locale::system_language(),
             recent_sessions: Vec::new(),
         }
     }
@@ -478,10 +478,27 @@ mod tests {
             "font_size": 16.0
         }"#;
         let settings: Settings = serde_json::from_str(json).expect("old settings should load");
-        assert_eq!(settings.language, Language::English);
+        assert_eq!(settings.language, super::super::locale::system_language());
         assert!(settings.recent_sessions.is_empty());
         assert_eq!(settings.theme, Theme::Dark);
         assert_eq!(settings.font_size, 16.0);
+    }
+
+    #[test]
+    fn first_launch_uses_system_language_and_saved_choices_take_precedence() {
+        assert_eq!(
+            Settings::load(None).language,
+            super::super::locale::system_language()
+        );
+        for language in Language::ALL {
+            let settings = Settings {
+                language,
+                ..Settings::default()
+            };
+            let json = serde_json::to_string(&settings).unwrap();
+            let restored: Settings = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored.language, language);
+        }
     }
 
     #[test]

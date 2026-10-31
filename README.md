@@ -41,6 +41,18 @@ If you are using a version older than Preview 2026-07-02b, consider upgrading.
 
 ## Usage
 
+### Windows portable release
+
+Download the Windows x64 ZIP ending in `-gui.zip` from the releases page and
+extract it to a folder. Open `timelapse4sai2-gui.exe` for the desktop app.
+The separate `-cli.zip` contains `timelapse4sai2.exe` for terminal use.
+Linux releases also provide separate `-gui.tar.gz` and `-cli.tar.gz` archives.
+The Windows Visual C++ runtime is linked statically, so
+there is no separate runtime installer or DLL bundle to install. FFmpeg must
+still be available in `PATH` for video export.
+
+### Build and CLI usage
+
 Build the CLI:
 
 ```sh
@@ -116,6 +128,8 @@ cargo build --release --all-features --locked
 
 The CLI-only release build is `cargo build --release --locked`. CI runs the
 all-features test suite on Linux and Windows and a release build on Windows.
+The repository's `.cargo/config.toml` enables static CRT linkage for Windows
+x64 MSVC builds, including local builds and release workflows.
 
 ### NixOS
 
