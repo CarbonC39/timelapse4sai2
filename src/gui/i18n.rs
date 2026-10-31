@@ -59,7 +59,6 @@ pub enum Key {
     CheckpointRatioTip,
     InputWatcher,
     InputWatcherTip,
-    LiveCanvas,
     Export,
     Output,
     Speed,
@@ -90,13 +89,11 @@ pub enum Key {
     Exporting,
     ExportComplete,
     Planning,
+    Refresh,
+    UnavailableValue,
     Loading,
     PreviewUnavailable,
     PreviewEmpty,
-    ZoomIn,
-    ZoomOut,
-    FitPreview,
-    MovePreview,
     PreviewRefreshTip,
     TooltipRefresh,
     ChooseDirectory,
@@ -109,7 +106,6 @@ pub enum Key {
     AboutFree,
     AboutDistribution,
     FinishingBeforeExit,
-    Sai2,
     Mp4,
     QuestionMark,
     Gib,
@@ -149,7 +145,7 @@ pub fn tr(key: Key) -> &'static str {
         English => "English",
         WaitingForSai => "Waiting for SAI…",
         CheckingCompatibility => "Checking compatibility…",
-        CompatibilityExact => "Supported",
+        CompatibilityExact => "SAI2 detected · Supported build",
         CompatibilityValidated => "Compatible build detected",
         CompatibilityUnsupported => "Unsupported build",
         NeedCanvas => "Open a canvas to finish compatibility checking",
@@ -182,7 +178,6 @@ pub fn tr(key: Key) -> &'static str {
         CheckpointRatioTip => "Write a checkpoint when this fraction of the canvas changes.",
         InputWatcher => "Input watcher",
         InputWatcherTip => "Use input activity to schedule captures.",
-        LiveCanvas => "Live SAI canvas",
         Export => "Export",
         Output => "Output",
         Speed => "Speed",
@@ -215,13 +210,11 @@ pub fn tr(key: Key) -> &'static str {
         Exporting => "Exporting…",
         ExportComplete => "Export complete",
         Planning => "Preparing export…",
+        Refresh => "Refresh",
+        UnavailableValue => "—",
         Loading => "Loading…",
         PreviewUnavailable => "Preview unavailable",
         PreviewEmpty => "Select a canvas or open a session to see a preview.",
-        ZoomIn => "Zoom in",
-        ZoomOut => "Zoom out",
-        FitPreview => "Fit preview",
-        MovePreview => "Move preview — drag to pan",
         PreviewRefreshTip => {
             "Read the current canvas or final session image once. During recording, this does not save a capture or change the timeline or statistics."
         }
@@ -238,7 +231,6 @@ pub fn tr(key: Key) -> &'static str {
             "Official releases are free at the linked repository. Paid third-party copies are unofficial."
         }
         FinishingBeforeExit => "Finishing before exit…",
-        Sai2 => "SAI 2",
         Mp4 => "MP4",
         QuestionMark => "?",
         Gib => "GiB",
@@ -267,4 +259,26 @@ pub fn format_dimensions(width: u32, height: u32) -> String {
 
 pub fn format_canvas(name: &str, width: u32, height: u32) -> String {
     format!("{} — {}×{}", name, width, height)
+}
+
+pub fn format_tracked(ms: u64) -> String {
+    let seconds = ms / 1000;
+    if seconds >= 3600 {
+        format!("{}h {}m", seconds / 3600, seconds / 60 % 60)
+    } else if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+pub fn format_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut text = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            text.push(',');
+        }
+        text.push(c);
+    }
+    text
 }

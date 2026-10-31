@@ -9,10 +9,6 @@ pub enum Icon {
     Export,
     Check,
     Warning,
-    ZoomIn,
-    ZoomOut,
-    Fit,
-    Move,
 }
 
 pub fn paint_icon(ui: &egui::Ui, icon: Icon, center: Pos2, size: f32, color: Color32) {
@@ -73,34 +69,6 @@ pub fn paint_icon(ui: &egui::Ui, icon: Icon, center: Pos2, size: f32, color: Col
             line(at(-0.36, 0.0), at(-0.08, 0.28));
             line(at(-0.08, 0.28), at(0.38, -0.28));
         }
-        Icon::ZoomIn | Icon::ZoomOut => {
-            painter.circle_stroke(at(-0.06, -0.06), size * 0.27, stroke);
-            line(at(0.15, 0.15), at(0.40, 0.40));
-            line(at(-0.20, -0.06), at(0.08, -0.06));
-            if matches!(icon, Icon::ZoomIn) {
-                line(at(-0.06, -0.20), at(-0.06, 0.08));
-            }
-        }
-        Icon::Fit => {
-            for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-                line(at(x * 0.18, y * 0.40), at(x * 0.40, y * 0.40));
-                line(at(x * 0.40, y * 0.40), at(x * 0.40, y * 0.18));
-            }
-        }
-        Icon::Move => {
-            line(at(-0.4, 0.0), at(0.4, 0.0));
-            line(at(0.0, -0.4), at(0.0, 0.4));
-            for (x, y) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
-                line(
-                    at(x * 0.4, y * 0.4),
-                    at(x * 0.22 - y * 0.12, y * 0.22 + x * 0.12),
-                );
-                line(
-                    at(x * 0.4, y * 0.4),
-                    at(x * 0.22 + y * 0.12, y * 0.22 - x * 0.12),
-                );
-            }
-        }
         Icon::Warning => {
             painter.add(egui::Shape::closed_line(
                 vec![at(0.0, -0.43), at(0.44, 0.35), at(-0.44, 0.35)],
@@ -146,12 +114,20 @@ pub fn action_button(
     enabled: bool,
     stop: bool,
 ) -> Response {
-    let height = (ui.text_style_height(&egui::TextStyle::Button) + 20.0).max(38.0);
+    let height = (ui.text_style_height(&egui::TextStyle::Button) + 14.0).clamp(32.0, 34.0);
     let color = if stop {
         Color32::from_rgb(177, 48, 54)
     } else {
         Color32::from_rgb(38, 105, 180)
     };
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let label_width = ui.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(label.to_owned(), font.clone(), Color32::WHITE)
+            .size()
+            .x
+    });
+    let width = (label_width + 62.0).max(150.0).min(ui.available_width());
     let response = ui.add_enabled(
         enabled,
         egui::Button::new("")
@@ -160,7 +136,7 @@ pub fn action_button(
             } else {
                 ui.visuals().widgets.inactive.bg_fill
             })
-            .min_size(egui::vec2(ui.available_width(), height)),
+            .min_size(egui::vec2(width, height)),
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     let text_color = if enabled {
@@ -175,16 +151,24 @@ pub fn action_button(
     paint_icon(
         ui,
         icon,
-        egui::pos2(response.rect.left() + 22.0, response.rect.center().y),
-        17.0,
+        egui::pos2(response.rect.left() + 21.0, response.rect.center().y),
+        16.0,
         text_color,
     );
     painter.text(
-        egui::pos2(response.rect.left() + 44.0, response.rect.center().y),
+        egui::pos2(response.rect.left() + 39.0, response.rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::TextStyle::Button.resolve(ui.style()),
+        font,
         text_color,
     );
+    if response.has_focus() {
+        painter.rect_stroke(
+            response.rect.expand(1.0),
+            ui.visuals().widgets.active.corner_radius,
+            ui.visuals().selection.stroke,
+            egui::StrokeKind::Outside,
+        );
+    }
     response
 }

@@ -32,7 +32,7 @@ impl Default for Settings {
         Self {
             theme: Theme::System,
             font: None,
-            font_size: 14.0,
+            font_size: 14.5,
         }
     }
 }
@@ -58,11 +58,23 @@ impl Settings {
         });
         let base = self.font_size.clamp(8.0, 40.0);
         ctx.all_styles_mut(|style| {
+            style.visuals.override_text_color =
+                Some(egui::Color32::from_gray(if style.visuals.dark_mode {
+                    222
+                } else {
+                    35
+                }));
+            style.visuals.weak_text_color =
+                Some(egui::Color32::from_gray(if style.visuals.dark_mode {
+                    170
+                } else {
+                    95
+                }));
             for (text_style, scale, family) in [
                 (TextStyle::Small, 0.85, FontFamily::Proportional),
                 (TextStyle::Body, 1.0, FontFamily::Proportional),
                 (TextStyle::Button, 1.0, FontFamily::Proportional),
-                (TextStyle::Heading, 1.5, FontFamily::Proportional),
+                (TextStyle::Heading, 20.0 / 14.5, FontFamily::Proportional),
                 (TextStyle::Monospace, 1.0, FontFamily::Monospace),
             ] {
                 style

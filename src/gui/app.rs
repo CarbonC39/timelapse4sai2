@@ -1,5 +1,5 @@
 use super::{
-    i18n::{Key, format_canvas, format_dimensions, format_size, tr},
+    i18n::{Key, format_canvas, format_count, format_dimensions, format_size, format_tracked, tr},
     preview::Preview,
     settings::{FontWindow, Settings},
     widgets::{Icon, action_button, icon_button, paint_icon},
@@ -65,6 +65,7 @@ enum Dialog {
     OpenSession,
     SessionFolder,
     Output,
+    OutputPath,
 }
 
 pub struct App {
@@ -318,7 +319,7 @@ impl App {
                 Dialog::SessionFolder => rfd::FileDialog::new()
                     .set_title(tr(Key::ChooseDirectory))
                     .pick_folder(),
-                Dialog::Output => {
+                Dialog::Output | Dialog::OutputPath => {
                     let mut suggestion = suggested_output;
                     loop {
                         let mut picker = rfd::FileDialog::new()
@@ -548,6 +549,9 @@ impl App {
                         match dialog {
                             Dialog::OpenSession => self.open_session(path),
                             Dialog::SessionFolder => self.set_recording_path(path),
+                            Dialog::OutputPath => {
+                                self.output_path = path.to_string_lossy().into_owned()
+                            }
                             Dialog::Output => {
                                 let mut output = path;
                                 output.set_extension("mp4");
@@ -625,8 +629,7 @@ impl App {
         });
     }
     fn source_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading(tr(Key::Sai2));
-        ui.add_space(6.0);
+        ui.heading(tr(Key::Canvas));
         ui.horizontal(|ui| {
             if self.detecting {
                 ui.spinner();
@@ -636,12 +639,12 @@ impl App {
                     CompatibilityStatus::ExactKnownBuild => (
                         Key::CompatibilityExact,
                         Icon::Check,
-                        egui::Color32::from_rgb(55, 160, 100),
+                        egui::Color32::from_rgb(62, 169, 112),
                     ),
                     CompatibilityStatus::SignatureValidated => (
                         Key::CompatibilityValidated,
                         Icon::Check,
-                        egui::Color32::from_rgb(55, 160, 100),
+                        egui::Color32::from_rgb(62, 169, 112),
                     ),
                     CompatibilityStatus::NeedsCanvas => {
                         (Key::NeedCanvas, Icon::Warning, ui.visuals().warn_fg_color)
@@ -652,39 +655,32 @@ impl App {
                         ui.visuals().error_fg_color,
                     ),
                 };
-                ui.label(tr(key));
                 let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
-                paint_icon(ui, icon, rect.center(), 16.0, color);
+                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                paint_icon(ui, icon, rect.center(), 14.0, color);
+                ui.label(tr(key));
             } else {
-                ui.label(tr(
-                    if matches!(self.connection_error, Some(ConnectionError::Unsupported(_))) {
-                        Key::CompatibilityUnsupported
+                let key = match &self.connection_error {
+                    Some(ConnectionError::Unsupported(_)) => Key::CompatibilityUnsupported,
+                    Some(ConnectionError::NotFound(_)) | None => Key::WaitingForSai,
+                    _ => Key::ErrorProcessAccess,
+                };
+                let response =
+                    if matches!(key, Key::CompatibilityUnsupported | Key::ErrorProcessAccess) {
+                        ui.colored_label(ui.visuals().error_fg_color, tr(key))
                     } else {
-                        Key::WaitingForSai
-                    },
-                ));
+                        ui.label(tr(key))
+                    };
+                if let Some(error) = &self.connection_error {
+                    response.on_hover_text(error.to_string());
+                }
             }
         });
-        if let Some(error) = &self.connection_error
-            && !matches!(error, ConnectionError::NotFound(_))
-        {
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                tr(if matches!(error, ConnectionError::Unsupported(_)) {
-                    Key::CompatibilityUnsupported
-                } else {
-                    Key::ErrorProcessAccess
-                }),
-            )
-            .on_hover_text(error.to_string());
-        }
-        ui.add_space(6.0);
-        ui.label(tr(Key::Canvas));
-        let before = self.selected;
+        let mut canvas_chosen = false;
         ui.horizontal(|ui| {
+            let size = ui.spacing().interact_size.y.max(28.0);
             egui::ComboBox::from_id_salt("canvas")
-                .width((ui.available_width() - 40.0).max(100.0))
+                .width((ui.available_width() - size - ui.spacing().item_spacing.x).max(100.0))
                 .selected_text(
                     self.detected
                         .as_ref()
@@ -695,7 +691,12 @@ impl App {
                 .show_ui(ui, |ui| {
                     if let Some(d) = &self.detected {
                         for (i, c) in d.canvases.iter().enumerate() {
-                            ui.selectable_value(&mut self.selected, i, canvas_label(c));
+                            if ui
+                                .selectable_value(&mut self.selected, i, canvas_label(c))
+                                .clicked()
+                            {
+                                canvas_chosen = true;
+                            }
                         }
                     }
                 });
@@ -703,34 +704,22 @@ impl App {
                 self.refresh_connection();
             }
         });
-        if before != self.selected {
+        if canvas_chosen {
             self.session_source = false;
             self.invalidate_preview();
             self.request_preview();
-        }
-        if self.session_source && ui.button(tr(Key::LiveCanvas)).clicked() {
-            self.session_source = false;
-            self.invalidate_preview();
-            self.request_preview();
-        }
-        if let Some(c) = self
-            .detected
-            .as_ref()
-            .and_then(|d| d.canvases.get(self.selected))
-        {
-            ui.weak(format_dimensions(c.width, c.height));
         }
     }
     fn recording_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading(tr(Key::RecordingSection));
-        ui.add_space(8.0);
         let busy = self.recording_busy();
         ui.add_enabled_ui(!busy && !self.export_busy() && !self.dialog_open, |ui| {
             ui.label(tr(Key::Session));
             ui.horizontal(|ui| {
-                let width = (ui.available_width() - 40.0).max(100.0);
+                let size = ui.spacing().interact_size.y.max(28.0);
+                let width = (ui.available_width() - size - ui.spacing().item_spacing.x).max(100.0);
                 let response = ui.add_sized(
-                    [width, ui.spacing().interact_size.y],
+                    [width, size],
                     egui::TextEdit::singleline(&mut self.session_path),
                 );
                 if response.changed() {
@@ -781,46 +770,14 @@ impl App {
             .map(|s| s.disk_bytes)
             .or_else(|| self.summary.as_ref().map(|s| s.disk_bytes))
             .unwrap_or(0);
-        egui::Grid::new("stats")
-            .spacing([24.0, 8.0])
-            .min_col_width(100.0)
-            .show(ui, |ui| {
-                ui.weak(tr(Key::Tracked));
-                ui.label(duration(tracked / 1000 * 1000));
-                ui.end_row();
-                ui.weak(tr(Key::Captures));
-                ui.label(captures.to_string());
-                ui.end_row();
-                ui.weak(tr(Key::Size));
-                ui.label(format_size(size));
-                ui.end_row();
-            });
-        ui.add_space(10.0);
-        match &self.recording {
-            RecordingState::Idle | RecordingState::Error(_) => {
-                let enabled = !self.export_busy()
-                    && !self.dialog_open
-                    && self
-                        .detected
-                        .as_ref()
-                        .is_some_and(|d| !d.canvases.is_empty());
-                if action_button(ui, Icon::Play, tr(Key::StartRecording), enabled, false).clicked()
-                {
-                    self.start();
-                }
-            }
-            RecordingState::Starting | RecordingState::Recording => {
-                if action_button(ui, Icon::Stop, tr(Key::StopRecording), true, true).clicked() {
-                    self.stop();
-                }
-            }
-            RecordingState::Stopping => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(tr(Key::Stopping));
-                });
-            }
-        }
+        ui.columns(3, |columns| {
+            columns[0].weak(tr(Key::Tracked));
+            columns[0].label(format_tracked(tracked));
+            columns[1].weak(tr(Key::Captures));
+            columns[1].label(format_count(captures));
+            columns[2].weak(tr(Key::Size));
+            columns[2].label(format_size(size));
+        });
         if let RecordingState::Error(e) = &self.recording {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
@@ -882,132 +839,102 @@ impl App {
                     });
                 });
         });
+        ui.add_space(6.0);
+        match &self.recording {
+            RecordingState::Idle | RecordingState::Error(_) => {
+                let enabled = !self.export_busy()
+                    && !self.dialog_open
+                    && self
+                        .detected
+                        .as_ref()
+                        .is_some_and(|d| !d.canvases.is_empty());
+                if action_button(ui, Icon::Play, tr(Key::StartRecording), enabled, false).clicked()
+                {
+                    self.start();
+                }
+            }
+            RecordingState::Starting | RecordingState::Recording => {
+                if action_button(ui, Icon::Stop, tr(Key::StopRecording), true, true).clicked() {
+                    self.stop();
+                }
+            }
+            RecordingState::Stopping => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(tr(Key::Stopping));
+                });
+            }
+        }
     }
     fn export_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading(tr(Key::Export));
-        ui.add_space(8.0);
         let before = format!("{:?}", self.options);
-        ui.add_enabled_ui(
-            !self.recording_busy() && !self.export_busy() && !self.dialog_open,
-            |ui| {
-                ui.add_space(6.0);
-                field_grid(ui, "export-main", |ui| {
-                    ui.label(tr(Key::Speed));
-                    ui.add(
-                        egui::DragValue::new(&mut self.options.speed)
-                            .range(0.01..=10000.0)
-                            .speed(0.1)
-                            .suffix(tr(Key::MultiplierSuffix)),
-                    );
-                    ui.end_row();
-                    combo(
-                        ui,
-                        "quality",
-                        Key::Quality,
-                        &mut self.options.quality,
-                        &[
-                            (Quality::Draft, Key::Draft),
-                            (Quality::Balanced, Key::Balanced),
-                            (Quality::High, Key::High),
-                            (Quality::Archival, Key::Archival),
-                        ],
-                    );
-                });
-                ui.add_space(6.0);
-                egui::CollapsingHeader::new(tr(Key::Advanced))
-                    .id_salt("export-advanced")
-                    .show(ui, |ui| {
-                        field_grid(ui, "export-fields", |ui| {
-                            ui.label(tr(Key::Fps));
-                            ui.add(egui::DragValue::new(&mut self.options.fps).range(1..=240));
-                            ui.end_row();
-                            combo(
-                                ui,
-                                "encoder",
-                                Key::Encoder,
-                                &mut self.options.encoder,
-                                &[
-                                    (Encoder::Auto, Key::Auto),
-                                    (Encoder::Nvenc, Key::Nvenc),
-                                    (Encoder::X264, Key::X264),
-                                ],
-                            );
-                            combo(
-                                ui,
-                                "resolution",
-                                Key::Resolution,
-                                &mut self.options.size,
-                                &[
-                                    (Size::Auto, Key::Auto),
-                                    (Size::P1080, Key::P1080),
-                                    (Size::P1440, Key::P1440),
-                                    (Size::P2160, Key::P2160),
-                                ],
-                            );
-                            combo(
-                                ui,
-                                "canvas-mode",
-                                Key::CanvasMode,
-                                &mut self.options.canvas_mode,
-                                &[
-                                    (CanvasMode::Max, Key::MaxCanvas),
-                                    (CanvasMode::Initial, Key::InitialCanvas),
-                                ],
-                            );
-                            ui.label(tr(Key::HoldEnd));
-                            ui.add(
-                                egui::DragValue::new(&mut self.options.hold_end)
-                                    .range(0.0..=3600.0)
-                                    .speed(0.1)
-                                    .suffix(tr(Key::SecondsSuffix)),
-                            );
-                            ui.end_row();
-                            ui.label(tr(Key::PreviewEnd));
-                            ui.add(
-                                egui::DragValue::new(&mut self.options.preview_end)
-                                    .range(0.0..=3600.0)
-                                    .speed(0.1)
-                                    .suffix(tr(Key::SecondsSuffix)),
-                            );
-                            ui.end_row();
-                            ui.label(tr(Key::SkipProvisional));
-                            ui.checkbox(&mut self.options.skip_provisional, "");
-                            ui.end_row();
-                        });
-                    });
-            },
-        );
-        if before != format!("{:?}", self.options) {
-            self.request_plan();
-        }
-        ui.add_space(8.0);
-        if let Some(plan) = &self.plan {
-            egui::Grid::new("plan")
-                .spacing([24.0, 8.0])
-                .min_col_width(100.0)
-                .show(ui, |ui| {
-                    ui.weak(tr(Key::VideoLength));
-                    ui.label(duration(plan.duration_ms));
-                    ui.end_row();
-                    ui.weak(tr(Key::Output));
-                    ui.label(format_dimensions(plan.output_width, plan.output_height));
-                    ui.end_row();
-                });
-        } else if self.exporting == ExportState::Planning {
-            ui.label(tr(Key::Planning));
-        }
-        ui.add_space(10.0);
-        let enabled = !self.recording_busy()
-            && !self.export_busy()
-            && !self.dialog_open
-            && self.plan.is_some();
-        if action_button(ui, Icon::Export, tr(Key::ExportVideo), enabled, false).clicked() {
-            self.choose(Dialog::Output);
-        }
-        for w in &self.export_warnings {
-            ui.colored_label(ui.visuals().warn_fg_color, w);
+        let editable = !self.recording_busy() && !self.export_busy() && !self.dialog_open;
+        ui.add_enabled_ui(editable, |ui| {
+            ui.label(tr(Key::Output));
+            ui.horizontal(|ui| {
+                let size = ui.spacing().interact_size.y.max(28.0);
+                let width = (ui.available_width() - size - ui.spacing().item_spacing.x).max(100.0);
+                ui.add_sized(
+                    [width, size],
+                    egui::TextEdit::singleline(&mut self.output_path),
+                );
+                if icon_button(ui, Icon::Folder, tr(Key::ChooseOutput), !self.dialog_open).clicked()
+                {
+                    self.choose(Dialog::OutputPath);
+                }
+            });
+            field_grid(ui, "export-main", |ui| {
+                ui.label(tr(Key::Speed));
+                ui.add(
+                    egui::DragValue::new(&mut self.options.speed)
+                        .range(0.01..=10000.0)
+                        .speed(0.1)
+                        .suffix(tr(Key::MultiplierSuffix)),
+                );
+                ui.end_row();
+                combo(
+                    ui,
+                    "quality",
+                    Key::Quality,
+                    &mut self.options.quality,
+                    &[
+                        (Quality::Draft, Key::Draft),
+                        (Quality::Balanced, Key::Balanced),
+                        (Quality::High, Key::High),
+                        (Quality::Archival, Key::Archival),
+                    ],
+                );
+            });
+        });
+        egui::Grid::new("plan")
+            .spacing([18.0, 5.0])
+            .min_col_width(140.0)
+            .show(ui, |ui| {
+                ui.label(tr(Key::VideoLength));
+                ui.label(
+                    self.plan
+                        .as_ref()
+                        .map(|p| duration(p.duration_ms))
+                        .unwrap_or_else(|| tr(Key::UnavailableValue).into()),
+                );
+                ui.end_row();
+                ui.label(tr(Key::Output));
+                ui.label(
+                    self.plan
+                        .as_ref()
+                        .map(|p| format_dimensions(p.output_width, p.output_height))
+                        .unwrap_or_else(|| tr(Key::UnavailableValue).into()),
+                );
+                ui.end_row();
+            });
+        for warning in &self.export_warnings {
+            ui.colored_label(ui.visuals().warn_fg_color, warning);
         }
         match &self.exporting {
+            ExportState::Planning => {
+                ui.weak(tr(Key::Planning));
+            }
             ExportState::Exporting => {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -1022,10 +949,81 @@ impl App {
                 ui.label(tr(Key::ExportComplete))
                     .on_hover_text(&self.output_path);
             }
-            ExportState::Error(e) => {
-                ui.colored_label(ui.visuals().error_fg_color, e);
+            ExportState::Error(error) => {
+                ui.colored_label(ui.visuals().error_fg_color, error);
             }
             _ => (),
+        }
+        ui.add_enabled_ui(editable, |ui| {
+            egui::CollapsingHeader::new(tr(Key::Advanced))
+                .id_salt("export-advanced")
+                .show(ui, |ui| {
+                    field_grid(ui, "export-fields", |ui| {
+                        ui.label(tr(Key::Fps));
+                        ui.add(egui::DragValue::new(&mut self.options.fps).range(1..=240));
+                        ui.end_row();
+                        combo(
+                            ui,
+                            "encoder",
+                            Key::Encoder,
+                            &mut self.options.encoder,
+                            &[
+                                (Encoder::Auto, Key::Auto),
+                                (Encoder::Nvenc, Key::Nvenc),
+                                (Encoder::X264, Key::X264),
+                            ],
+                        );
+                        combo(
+                            ui,
+                            "resolution",
+                            Key::Resolution,
+                            &mut self.options.size,
+                            &[
+                                (Size::Auto, Key::Auto),
+                                (Size::P1080, Key::P1080),
+                                (Size::P1440, Key::P1440),
+                                (Size::P2160, Key::P2160),
+                            ],
+                        );
+                        combo(
+                            ui,
+                            "canvas-mode",
+                            Key::CanvasMode,
+                            &mut self.options.canvas_mode,
+                            &[
+                                (CanvasMode::Max, Key::MaxCanvas),
+                                (CanvasMode::Initial, Key::InitialCanvas),
+                            ],
+                        );
+                        ui.label(tr(Key::HoldEnd));
+                        ui.add(
+                            egui::DragValue::new(&mut self.options.hold_end)
+                                .range(0.0..=3600.0)
+                                .speed(0.1)
+                                .suffix(tr(Key::SecondsSuffix)),
+                        );
+                        ui.end_row();
+                        ui.label(tr(Key::PreviewEnd));
+                        ui.add(
+                            egui::DragValue::new(&mut self.options.preview_end)
+                                .range(0.0..=3600.0)
+                                .speed(0.1)
+                                .suffix(tr(Key::SecondsSuffix)),
+                        );
+                        ui.end_row();
+                        ui.label(tr(Key::SkipProvisional));
+                        ui.checkbox(&mut self.options.skip_provisional, "");
+                        ui.end_row();
+                    });
+                });
+        });
+        if before != format!("{:?}", self.options) {
+            self.request_plan();
+        }
+        ui.add_space(6.0);
+        let enabled = editable && self.plan.is_some();
+        if action_button(ui, Icon::Export, tr(Key::ExportVideo), enabled, false).clicked() {
+            self.choose(Dialog::Output);
         }
     }
 }
@@ -1058,24 +1056,20 @@ impl eframe::App for App {
                 ui.label(tr(Key::FinishingBeforeExit));
             });
         }
+        let controls_width = ctx.available_rect().width() * 0.60;
         egui::SidePanel::left("controls")
-            .resizable(true)
-            .default_width(440.0)
-            .min_width(410.0)
+            .resizable(false)
+            .exact_width(controls_width)
             .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 8.0;
+                ui.spacing_mut().item_spacing.y = 5.0;
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.add_enabled_ui(
                         !self.recording_busy() && !self.export_busy() && !self.dialog_open,
                         |ui| self.source_ui(ui),
                     );
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.add_space(8.0);
+                    ui.add_space(18.0);
                     self.recording_ui(ui);
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.add_space(8.0);
+                    ui.add_space(18.0);
                     self.export_ui(ui);
                 });
             });
@@ -1154,7 +1148,7 @@ fn field_grid(ui: &mut egui::Ui, id: &str, body: impl FnOnce(&mut egui::Ui)) {
         egui::Grid::new(id)
             .num_columns(2)
             .min_col_width(140.0)
-            .spacing([20.0, 10.0])
+            .spacing([18.0, 6.0])
             .show(ui, body);
     });
 }
