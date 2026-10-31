@@ -15,7 +15,7 @@ impl SaiGeneration {
 #[derive(Debug, Clone, Copy)]
 pub enum RootLocator {
     FixedRva(usize),
-    Signature(super::signature::SignatureLocator<'static>),
+    Signature(&'static [super::signature::SignatureLocator<'static>]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

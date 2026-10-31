@@ -12,6 +12,6 @@ pub static SIGNATURE_PROFILE: SaiProfile = SaiProfile {
     display_name: "SAI Ver.2 64bit - Major Renovated (signature validated)",
     executable_hash: "",
     generation: SaiGeneration::Renovated,
-    locator: RootLocator::Signature(super::super::signature::RENOVATED_SIGNATURE),
+    locator: RootLocator::Signature(&super::super::signature::RENOVATED_SIGNATURES),
     layout: &super::super::layouts::renovated_alpha::LAYOUT,
 };

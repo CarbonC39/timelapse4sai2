@@ -87,7 +87,7 @@ fn run() -> Result<(), String> {
         Ok(profile) => (profile, CompatibilityStatus::ExactKnownBuild, None),
         Err(_) => {
             let profile = &sai::builds::renovated_2026_10_19::SIGNATURE_PROFILE;
-            let RootLocator::Signature(signature) = profile.locator else {
+            let RootLocator::Signature(signatures) = profile.locator else {
                 unreachable!();
             };
             let image = std::fs::read(process.executable_path()).map_err(|e| {
@@ -98,8 +98,7 @@ fn run() -> Result<(), String> {
                     "executable changed during signature scan".into(),
                 ));
             }
-            let rva = signature
-                .resolve(&image)
+            let rva = sai::signature::resolve_signatures(signatures, &image)
                 .map_err(|e| unsupported(format!("Renovated signature scan failed: {e}")))?;
             (profile, CompatibilityStatus::SignatureValidated, Some(rva))
         }

@@ -17,7 +17,7 @@ pub struct SignatureLocator<'a> {
     pub instruction_end_offset: usize,
 }
 
-/// Stable Renovated root reference seen in 2026-08-24 through 2026-10-19 builds.
+/// Stable Renovated root reference seen in 2026-08-13 through 2026-10-19 builds.
 pub const RENOVATED_PATTERN: &[u8] = &[
     0x40, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0x3d, 0, 0, 0, 0, 0x48, 0x85, 0xff, 0x0f, 0x84,
     0, 0, 0, 0, 0x48, 0x89, 0x5c,
@@ -32,6 +32,44 @@ pub const RENOVATED_SIGNATURE: SignatureLocator<'static> = SignatureLocator {
     rip_disp_offset: 9,
     instruction_end_offset: 13,
 };
+
+pub const RENOVATED_ROOT_PATTERN: &[u8] = &[
+    0x48, 0x8b, 0x1d, 0, 0, 0, 0, 0x48, 0x8b, 0x79, 0x68, 0x48, 0x85, 0xdb, 0x74, 0x41, 0x48, 0x89,
+    0x74, 0x24, 0x30,
+];
+pub const RENOVATED_ROOT_MASK: &[bool] = &[
+    true, true, true, false, false, false, false, true, true, true, true, true, true, true, true,
+    true, true, true, true, true, true,
+];
+pub const RENOVATED_ROOT_SIGNATURE: SignatureLocator<'static> = SignatureLocator {
+    pattern: RENOVATED_ROOT_PATTERN,
+    mask: RENOVATED_ROOT_MASK,
+    rip_disp_offset: 3,
+    instruction_end_offset: 7,
+};
+
+pub const RENOVATED_SIGNATURES: &[SignatureLocator<'static>] =
+    &[RENOVATED_SIGNATURE, RENOVATED_ROOT_SIGNATURE];
+
+/// Resolve independent fallback signatures, requiring unique matches and agreement.
+pub fn resolve_signatures(
+    signatures: &[SignatureLocator<'_>],
+    image: &[u8],
+) -> Result<usize, String> {
+    let mut resolved = None;
+    for signature in signatures {
+        if let Some(rva) = signature.resolve_optional(image)? {
+            if resolved.is_some_and(|previous| previous != rva) {
+                return Err(format!(
+                    "signature targets disagree: {:#x} and {rva:#x}",
+                    resolved.unwrap()
+                ));
+            }
+            resolved = Some(rva);
+        }
+    }
+    resolved.ok_or_else(|| "no signature matched in .text".into())
+}
 
 #[derive(Debug, Clone, Copy)]
 struct Section<'a> {
@@ -139,7 +177,13 @@ fn parse_sections(image: &[u8]) -> Result<Vec<Section<'_>>, String> {
 impl SignatureLocator<'_> {
     /// Find the unique masked signature in `.text`, resolve its RIP-relative target,
     /// and require that target to reside in a writable, non-executable section.
+    #[allow(dead_code)] // Also useful for validating each signature independently offline.
     pub fn resolve(&self, image: &[u8]) -> Result<usize, String> {
+        self.resolve_optional(image)?
+            .ok_or_else(|| "signature did not match in .text".into())
+    }
+
+    fn resolve_optional(&self, image: &[u8]) -> Result<Option<usize>, String> {
         if self.pattern.is_empty() || self.pattern.len() != self.mask.len() {
             return Err(
                 "invalid signature: pattern and mask must have equal nonzero lengths".into(),
@@ -189,7 +233,9 @@ impl SignatureLocator<'_> {
                 }
             }
         }
-        let offset = match_offset.ok_or("signature did not match in .text")?;
+        let Some(offset) = match_offset else {
+            return Ok(None);
+        };
         let instruction_rva = u64::from(text.virtual_address)
             .checked_add(offset as u64)
             .ok_or("signature RVA overflow")?;
@@ -222,7 +268,7 @@ impl SignatureLocator<'_> {
                 "RIP-relative target {target:#x} is outside writable non-executable sections"
             ));
         }
-        Ok(target as usize)
+        Ok(Some(target as usize))
     }
 }
 
@@ -309,11 +355,39 @@ mod tests {
     }
 
     #[test]
+    fn fallback_resolves_missing_primary_and_rejects_disagreement() {
+        let fallback = SignatureLocator {
+            pattern: &[0x49, 0x8b, 0, 0, 0, 0],
+            mask: &[true, true, false, false, false, false],
+            rip_disp_offset: 2,
+            instruction_end_offset: 6,
+        };
+        let mut image = synthetic_pe();
+        image[0x430..0x432].copy_from_slice(&[0x49, 0x8b]);
+        image[0x432..0x436].copy_from_slice(&0x1feai32.to_le_bytes());
+        image[0x410] = 0x90;
+        assert_eq!(
+            resolve_signatures(&[locator(), fallback], &image),
+            Ok(0x3020)
+        );
+
+        image[0x410] = 0x48;
+        image[0x432..0x436].copy_from_slice(&0x1ffai32.to_le_bytes());
+        assert!(
+            resolve_signatures(&[locator(), fallback], &image)
+                .unwrap_err()
+                .contains("disagree")
+        );
+    }
+
+    #[test]
     fn resolves_available_renovated_pe_samples() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         for (directory, expected_rva) in [
-            // 0824 is a repository-derived cross-check, not a supplied ground-truth date.
+            // These two dates are derived from both signatures, not supplied ground truth.
+            ("0813", 0x472380),
             ("0824", 0x474380),
+            ("0902", 0x476280),
             ("0925", 0x478280),
             ("1019", 0x47a380),
         ] {
@@ -323,10 +397,18 @@ mod tests {
             }
             let image = std::fs::read(&path)
                 .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+            for signature in RENOVATED_SIGNATURES {
+                assert_eq!(
+                    signature.resolve(&image),
+                    Ok(expected_rva),
+                    "unexpected or non-unique Renovated signature in {}",
+                    path.display()
+                );
+            }
             assert_eq!(
-                RENOVATED_SIGNATURE.resolve(&image),
+                resolve_signatures(RENOVATED_SIGNATURES, &image),
                 Ok(expected_rva),
-                "unexpected or non-unique Renovated signature in {}",
+                "fallback signatures disagree in {}",
                 path.display()
             );
         }
