@@ -1,15 +1,17 @@
 use super::{
-    i18n::{Key, format_canvas, format_count, format_dimensions, format_size, format_tracked, tr},
+    i18n::{
+        Key, Translator, format_canvas, format_count, format_dimensions, format_duration,
+    },
     preview::Preview,
     settings::{FontWindow, Settings},
     widgets::{
-        ActionStyle, Icon, action_button, advanced_toggle, form_label, icon_button, metrics_row,
-        paint_icon, path_edit,
+        ActionStyle, Icon, action_button, advanced_toggle, form_label, help_icon, icon_button,
+        metrics_row, paint_icon, path_edit,
     },
 };
 use eframe::egui;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -104,6 +106,9 @@ pub struct App {
     closing: bool,
     dialog_open: bool,
     session_edited: bool,
+    /// Path currently being opened through the session picker or recent list.
+    /// Once the background load succeeds it is promoted in the recent list.
+    open_request: Option<PathBuf>,
     plan_due: Option<std::time::Instant>,
     plan_running: bool,
     export_progress: (u64, u64),
@@ -153,12 +158,16 @@ impl App {
             closing: false,
             dialog_open: false,
             session_edited: false,
+            open_request: None,
             plan_due: None,
             plan_running: false,
             export_progress: (0, 0),
         };
         app.refresh_connection();
         app
+    }
+    fn i18n(&self) -> Translator {
+        self.settings.i18n()
     }
     fn recording_busy(&self) -> bool {
         matches!(
@@ -218,6 +227,7 @@ impl App {
             .as_ref()
             .and_then(|d| d.canvases.get(self.selected).map(|c| (d.pid, c.clone())))
         {
+            let i18n = self.i18n();
             self.launch(move || {
                 Message::Preview(
                     revision,
@@ -232,7 +242,7 @@ impl App {
                                     && c.id == canvas.id
                                     && c.name == canvas.name
                             })
-                            .ok_or_else(|| tr(Key::ErrorNoCanvas).to_owned())?;
+                            .ok_or_else(|| i18n.tr(Key::ErrorNoCanvas).to_owned())?;
                         PreviewImage::from_live(&connection.reader(), current, 512, 512 * 512)
                     })(),
                 )
@@ -247,8 +257,15 @@ impl App {
         self.preview.loading = false;
         self.preview.clear();
     }
+    fn remember_current_session(&mut self) {
+        if !self.session_path.trim().is_empty() {
+            self.settings
+                .remember_session(PathBuf::from(&self.session_path));
+        }
+    }
     fn open_session(&mut self, path: PathBuf) {
         self.session_edited = false;
+        self.open_request = Some(path.clone());
         self.session_path = path.to_string_lossy().into_owned();
         self.session_source = true;
         self.stats = None;
@@ -271,6 +288,7 @@ impl App {
     }
     fn set_recording_path(&mut self, path: PathBuf) {
         self.session_edited = false;
+        self.open_request = None;
         self.session_path = path.to_string_lossy().into_owned();
         self.summary = None;
         self.stats = None;
@@ -334,21 +352,22 @@ impl App {
             return;
         }
         self.dialog_open = true;
+        let i18n = self.i18n();
         let suggested_output = PathBuf::from(&self.output_path);
         self.launch(move || {
             let result = match dialog {
                 Dialog::OpenSession => rfd::FileDialog::new()
-                    .set_title(tr(Key::OpenSession))
+                    .set_title(i18n.tr(Key::OpenSession))
                     .pick_folder(),
                 Dialog::SessionFolder => rfd::FileDialog::new()
-                    .set_title(tr(Key::ChooseDirectory))
+                    .set_title(i18n.tr(Key::ChooseDirectory))
                     .pick_folder(),
                 Dialog::Output | Dialog::OutputPath => {
                     let mut suggestion = suggested_output;
                     loop {
                         let mut picker = rfd::FileDialog::new()
-                            .set_title(tr(Key::ChooseOutput))
-                            .add_filter(tr(Key::Mp4), &["mp4"]);
+                            .set_title(i18n.tr(Key::ChooseOutput))
+                            .add_filter(i18n.tr(Key::Mp4), &["mp4"]);
                         if let Some(parent) = suggestion.parent()
                             && !parent.as_os_str().is_empty()
                             && parent.is_dir()
@@ -401,6 +420,7 @@ impl App {
                 .into_owned();
         }
         self.recording_warnings.clear();
+        self.open_request = None;
         self.recording = RecordingState::Starting;
         self.exporting = ExportState::Idle;
         self.plan = None;
@@ -417,6 +437,7 @@ impl App {
         let config = self.config.clone();
         let dir = PathBuf::from(&self.session_path);
         let tx = self.tx.clone();
+        let i18n = self.i18n();
         self.launch(move || {
             Message::Recorded((|| {
                 let connection = Connection::discover(Some(pid))?;
@@ -424,7 +445,7 @@ impl App {
                     .canvases
                     .iter()
                     .find(|c| **c == canvas)
-                    .ok_or_else(|| tr(Key::ErrorNoCanvas).to_owned())?;
+                    .ok_or_else(|| i18n.tr(Key::ErrorNoCanvas).to_owned())?;
                 recorder::record_cancellable(
                     &connection.reader(),
                     current,
@@ -498,8 +519,16 @@ impl App {
                             self.stats = None;
                             self.summary = Some(summary);
                             self.session_error = None;
+                            if let Some(path) = self.open_request.take() {
+                                self.settings.remember_session(path);
+                            }
                         }
-                        Err(e) => self.session_error = Some(e),
+                        Err(e) => {
+                            if let Some(path) = self.open_request.take() {
+                                self.settings.forget_session(&path);
+                            }
+                            self.session_error = Some(e);
+                        }
                     }
                 }
                 Message::Plan(revision, result) => {
@@ -536,12 +565,14 @@ impl App {
                     self.stats = Some(stats);
                     if self.recording == RecordingState::Starting {
                         self.recording = RecordingState::Recording;
+                        self.remember_current_session();
                     }
                 }
                 Message::Recorded(result) => {
                     self.recording = match result {
                         Ok(warnings) => {
                             self.recording_warnings = warnings;
+                            self.remember_current_session();
                             RecordingState::Idle
                         }
                         Err(e) => RecordingState::Error(e),
@@ -591,23 +622,54 @@ impl App {
         }
     }
     fn menus(&mut self, ctx: &egui::Context) {
+        let i18n = self.i18n();
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button(tr(Key::File), |ui| {
+                ui.menu_button(i18n.tr(Key::File), |ui| {
+                    let can_open =
+                        !self.recording_busy() && !self.export_busy() && !self.dialog_open;
                     if ui
-                        .add_enabled(
-                            !self.recording_busy() && !self.export_busy() && !self.dialog_open,
-                            egui::Button::new(tr(Key::OpenSession)),
-                        )
+                        .add_enabled(can_open, egui::Button::new(i18n.tr(Key::OpenSession)))
                         .clicked()
                     {
                         self.choose(Dialog::OpenSession);
                         ui.close();
                     }
+                    ui.menu_button(i18n.tr(Key::RecentSessions), |ui| {
+                        if self.settings.recent_sessions.is_empty() {
+                            ui.add_enabled(
+                                false,
+                                egui::Button::new(i18n.tr(Key::NoRecentSessions)),
+                            );
+                        } else {
+                            let recent = self.settings.recent_sessions.clone();
+                            for path in recent {
+                                let label = session_label(&path);
+                                let full_path = path.display().to_string();
+                                if ui
+                                    .add_enabled(can_open, egui::Button::new(label))
+                                    .on_hover_text(&full_path)
+                                    .clicked()
+                                {
+                                    match existing_recent_session(&mut self.settings, &path) {
+                                        Ok(path) => self.open_session(path),
+                                        Err(path) => {
+                                            self.session_error = Some(format!(
+                                                "{}: {}",
+                                                i18n.tr(Key::RecentSessionMissing),
+                                                path.display()
+                                            ));
+                                        }
+                                    }
+                                    ui.close();
+                                }
+                            }
+                        }
+                    });
                     if ui
                         .add_enabled(
                             !self.session_path.is_empty(),
-                            egui::Button::new(tr(Key::OpenSessionFolder)),
+                            egui::Button::new(i18n.tr(Key::OpenSessionFolder)),
                         )
                         .clicked()
                     {
@@ -618,15 +680,16 @@ impl App {
                         });
                         ui.close();
                     }
-                    if ui.button(tr(Key::Exit)).clicked() {
+                    if ui.button(i18n.tr(Key::Exit)).clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
-                ui.menu_button(tr(Key::View), |ui| {
+                ui.menu_button(i18n.tr(Key::View), |ui| {
                     let before = (
                         self.settings.theme,
                         self.settings.font.clone(),
                         self.settings.font_size,
+                        self.settings.language,
                     );
                     self.settings.view_menu(ui, &mut self.font_window);
                     if before
@@ -634,17 +697,19 @@ impl App {
                             self.settings.theme,
                             self.settings.font.clone(),
                             self.settings.font_size,
+                            self.settings.language,
                         )
                     {
                         self.settings.apply(ctx);
+                        ctx.request_repaint();
                     }
                 });
-                ui.menu_button(tr(Key::Help), |ui| {
-                    if ui.button(tr(Key::Repository)).clicked() {
+                ui.menu_button(i18n.tr(Key::Help), |ui| {
+                    if ui.button(i18n.tr(Key::Repository)).clicked() {
                         ctx.open_url(egui::OpenUrl::new_tab(REPOSITORY));
                         ui.close();
                     }
-                    if ui.button(tr(Key::About)).clicked() {
+                    if ui.button(i18n.tr(Key::About)).clicked() {
                         self.about = true;
                         ui.close();
                     }
@@ -653,11 +718,12 @@ impl App {
         });
     }
     fn source_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading(tr(Key::Canvas));
+        let i18n = self.i18n();
+        ui.heading(i18n.tr(Key::Canvas));
         ui.horizontal(|ui| {
             if self.detecting {
                 ui.spinner();
-                ui.label(tr(Key::CheckingCompatibility));
+                ui.label(i18n.tr(Key::CheckingCompatibility));
             } else if let Some(d) = &self.detected {
                 let (key, icon, color) = match d.compatibility {
                     CompatibilityStatus::ExactKnownBuild => (
@@ -682,7 +748,7 @@ impl App {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
                 paint_icon(ui, icon, rect.center(), 14.0, color);
-                ui.label(tr(key));
+                ui.label(i18n.tr(key));
             } else {
                 let key = match &self.connection_error {
                     Some(ConnectionError::Unsupported(_)) => Key::CompatibilityUnsupported,
@@ -691,9 +757,9 @@ impl App {
                 };
                 let response =
                     if matches!(key, Key::CompatibilityUnsupported | Key::ErrorProcessAccess) {
-                        ui.colored_label(ui.visuals().error_fg_color, tr(key))
+                        ui.colored_label(ui.visuals().error_fg_color, i18n.tr(key))
                     } else {
-                        ui.label(tr(key))
+                        ui.label(i18n.tr(key))
                     };
                 if let Some(error) = &self.connection_error {
                     response.on_hover_text(error.to_string());
@@ -711,7 +777,7 @@ impl App {
                         .as_ref()
                         .and_then(|d| d.canvases.get(self.selected))
                         .map(canvas_label)
-                        .unwrap_or_else(|| tr(Key::SelectCanvas).into()),
+                        .unwrap_or_else(|| i18n.tr(Key::SelectCanvas).into()),
                 )
                 .show_ui(ui, |ui| {
                     if let Some(d) = &self.detected {
@@ -725,7 +791,9 @@ impl App {
                         }
                     }
                 });
-            if icon_button(ui, Icon::Refresh, tr(Key::TooltipRefresh), !self.detecting).clicked() {
+            if icon_button(ui, Icon::Refresh, i18n.tr(Key::TooltipRefresh), !self.detecting)
+                .clicked()
+            {
                 self.refresh_connection();
             }
         });
@@ -736,14 +804,16 @@ impl App {
         }
     }
     fn recording_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading(tr(Key::RecordingSection));
+        let i18n = self.i18n();
+        ui.heading(i18n.tr(Key::RecordingSection));
         let editable = !self.recording_busy() && !self.export_busy() && !self.dialog_open;
         ui.add_enabled_ui(editable, |ui| {
-            form_row(ui, Key::Session, None, |ui| {
+            form_row(ui, i18n, Key::Session, None, |ui| {
                 let width = (ui.available_width() - 28.0 - ui.spacing().item_spacing.x).max(0.0);
                 let response = path_edit(ui, &mut self.session_path, width);
                 if response.changed() {
                     self.session_edited = true;
+                    self.open_request = None;
                     self.session_revision += 1;
                     self.stats = None;
                     self.summary = None;
@@ -762,7 +832,7 @@ impl App {
                 if icon_button(
                     ui,
                     Icon::Folder,
-                    tr(Key::ChooseDirectory),
+                    i18n.tr(Key::ChooseDirectory),
                     !self.dialog_open,
                 )
                 .clicked()
@@ -792,10 +862,11 @@ impl App {
             .unwrap_or(0);
         metrics_row(
             ui,
+            i18n,
             &[
-                (Key::Tracked, format_tracked(tracked)),
+                (Key::Tracked, i18n.tracked(tracked)),
                 (Key::Captures, format_count(captures)),
-                (Key::Size, format_size(bytes)),
+                (Key::Size, i18n.size(bytes)),
             ],
             self.settings.font_size,
         );
@@ -810,7 +881,7 @@ impl App {
         }
         ui.add_space(6.0);
         let mut advanced = self.record_advanced;
-        action_row(ui, &mut advanced, |ui| match &self.recording {
+        action_row(ui, i18n, &mut advanced, |ui| match &self.recording {
             RecordingState::Idle | RecordingState::Error(_) => {
                 let enabled = editable
                     && self
@@ -822,7 +893,14 @@ impl App {
                 } else {
                     ActionStyle::Primary
                 };
-                if action_button(ui, Icon::Play, tr(Key::StartRecording), enabled, style).clicked()
+                if action_button(
+                    ui,
+                    Icon::Play,
+                    i18n.tr(Key::StartRecording),
+                    enabled,
+                    style,
+                )
+                .clicked()
                 {
                     self.start();
                 }
@@ -831,7 +909,7 @@ impl App {
                 if action_button(
                     ui,
                     Icon::Stop,
-                    tr(Key::StopRecording),
+                    i18n.tr(Key::StopRecording),
                     true,
                     ActionStyle::Stop,
                 )
@@ -842,7 +920,7 @@ impl App {
             }
             RecordingState::Stopping => {
                 ui.spinner();
-                ui.label(tr(Key::Stopping));
+                ui.label(i18n.tr(Key::Stopping));
             }
         });
         self.record_advanced = advanced;
@@ -854,8 +932,10 @@ impl App {
         }
     }
     fn recording_advanced_ui(&mut self, ui: &mut egui::Ui) {
+        let i18n = self.i18n();
         option_u64(
             ui,
+            i18n,
             Key::IdleDelay,
             Key::IdleDelayTip,
             &mut self.config.idle_delay_ms,
@@ -863,6 +943,7 @@ impl App {
         );
         option_u64(
             ui,
+            i18n,
             Key::MinCaptureGap,
             Key::MinCaptureGapTip,
             &mut self.config.min_capture_gap_ms,
@@ -870,12 +951,13 @@ impl App {
         );
         option_u64(
             ui,
+            i18n,
             Key::MaxActiveGap,
             Key::MaxActiveGapTip,
             &mut self.config.max_active_gap_ms,
             1..=600000,
         );
-        form_row(ui, Key::ZstdLevel, Some(Key::ZstdLevelTip), |ui| {
+        form_row(ui, i18n, Key::ZstdLevel, Some(Key::ZstdLevelTip), |ui| {
             ui.add_sized(
                 [ui.available_width(), 28.0],
                 egui::DragValue::new(&mut self.config.zstd_level).range(-7..=22),
@@ -883,6 +965,7 @@ impl App {
         });
         option_u64(
             ui,
+            i18n,
             Key::CheckpointInterval,
             Key::CheckpointIntervalTip,
             &mut self.config.checkpoint_every_events,
@@ -890,6 +973,7 @@ impl App {
         );
         form_row(
             ui,
+            i18n,
             Key::CheckpointRatio,
             Some(Key::CheckpointRatioTip),
             |ui| {
@@ -897,38 +981,51 @@ impl App {
                     [ui.available_width(), 28.0],
                     egui::DragValue::new(&mut self.config.checkpoint_changed_ratio)
                         .range(0..=100)
-                        .suffix(tr(Key::PercentSuffix)),
+                        .suffix(i18n.tr(Key::PercentSuffix)),
                 );
             },
         );
-        form_row(ui, Key::InputWatcher, Some(Key::InputWatcherTip), |ui| {
-            let mut watch = !self.config.no_input_watch;
-            ui.checkbox(&mut watch, "");
-            self.config.no_input_watch = !watch;
-        });
+        form_row(
+            ui,
+            i18n,
+            Key::InputWatcher,
+            Some(Key::InputWatcherTip),
+            |ui| {
+                let mut watch = !self.config.no_input_watch;
+                ui.checkbox(&mut watch, "");
+                self.config.no_input_watch = !watch;
+            },
+        );
     }
     fn export_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading(tr(Key::Export));
+        let i18n = self.i18n();
+        ui.heading(i18n.tr(Key::Export));
         let before = format!("{:?}", self.options);
         let editable = !self.recording_busy() && !self.export_busy() && !self.dialog_open;
         ui.add_enabled_ui(editable, |ui| {
-            form_row(ui, Key::Output, None, |ui| {
+            form_row(ui, i18n, Key::Output, None, |ui| {
                 let width = (ui.available_width() - 28.0 - ui.spacing().item_spacing.x).max(0.0);
                 path_edit(ui, &mut self.output_path, width);
-                if icon_button(ui, Icon::Folder, tr(Key::ChooseOutput), !self.dialog_open).clicked()
+                if icon_button(
+                    ui,
+                    Icon::Folder,
+                    i18n.tr(Key::ChooseOutput),
+                    !self.dialog_open,
+                )
+                .clicked()
                 {
                     self.choose(Dialog::OutputPath);
                 }
             });
             ui.columns(2, |columns| {
-                form_row(&mut columns[0], Key::Speed, None, |ui| {
+                form_row(&mut columns[0], i18n, Key::Speed, None, |ui| {
                     egui::ComboBox::from_id_salt("speed")
                         .width(ui.available_width())
                         .truncate()
                         .selected_text(format!(
                             "{}{}",
                             self.options.speed,
-                            tr(Key::MultiplierSuffix)
+                            i18n.tr(Key::MultiplierSuffix)
                         ))
                         .show_ui(ui, |ui| {
                             for speed in [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0] {
@@ -936,7 +1033,10 @@ impl App {
                                     .selectable_value(
                                         &mut self.options.speed,
                                         speed,
-                                        format!("{speed}{}", tr(Key::MultiplierSuffix)),
+                                        format!(
+                                            "{speed}{}",
+                                            i18n.tr(Key::MultiplierSuffix)
+                                        ),
                                     )
                                     .clicked()
                                 {
@@ -944,18 +1044,19 @@ impl App {
                                 }
                             }
                             ui.separator();
-                            ui.label(tr(Key::CustomSpeed));
+                            ui.label(i18n.tr(Key::CustomSpeed));
                             ui.add(
                                 egui::DragValue::new(&mut self.options.speed)
                                     .range(0.01..=10000.0)
                                     .speed(0.1)
-                                    .suffix(tr(Key::MultiplierSuffix)),
+                                    .suffix(i18n.tr(Key::MultiplierSuffix)),
                             );
                         });
                 });
-                form_row(&mut columns[1], Key::Quality, None, |ui| {
+                form_row(&mut columns[1], i18n, Key::Quality, None, |ui| {
                     choice_combo(
                         ui,
+                        i18n,
                         "quality",
                         &mut self.options.quality,
                         &[
@@ -972,15 +1073,16 @@ impl App {
         let duration = self
             .plan
             .as_ref()
-            .map(|p| duration(p.duration_ms))
-            .unwrap_or_else(|| tr(Key::UnavailableValue).into());
+            .map(|p| format_duration(p.duration_ms))
+            .unwrap_or_else(|| i18n.tr(Key::UnavailableValue).into());
         let resolution = self
             .plan
             .as_ref()
             .map(|p| format_dimensions(p.output_width, p.output_height))
-            .unwrap_or_else(|| tr(Key::UnavailableValue).into());
+            .unwrap_or_else(|| i18n.tr(Key::UnavailableValue).into());
         metrics_row(
             ui,
+            i18n,
             &[(Key::Duration, duration), (Key::Resolution, resolution)],
             self.settings.font_size,
         );
@@ -989,12 +1091,12 @@ impl App {
         }
         match &self.exporting {
             ExportState::Planning => {
-                ui.weak(tr(Key::Planning));
+                ui.weak(i18n.tr(Key::Planning));
             }
             ExportState::Exporting => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(tr(Key::Exporting));
+                    ui.label(i18n.tr(Key::Exporting));
                 });
                 let (done, total) = self.export_progress;
                 if total > 0 {
@@ -1002,7 +1104,7 @@ impl App {
                 }
             }
             ExportState::Finished => {
-                ui.label(tr(Key::ExportComplete))
+                ui.label(i18n.tr(Key::ExportComplete))
                     .on_hover_text(&self.output_path);
             }
             ExportState::Error(error) => {
@@ -1012,7 +1114,7 @@ impl App {
         }
         ui.add_space(6.0);
         let mut advanced = self.export_advanced;
-        action_row(ui, &mut advanced, |ui| {
+        action_row(ui, i18n, &mut advanced, |ui| {
             let style = if self.export_priority() {
                 ActionStyle::Primary
             } else {
@@ -1021,7 +1123,7 @@ impl App {
             if action_button(
                 ui,
                 Icon::Export,
-                tr(Key::ExportVideo),
+                i18n.tr(Key::ExportVideo),
                 editable && self.plan.is_some(),
                 style,
             )
@@ -1042,7 +1144,8 @@ impl App {
         }
     }
     fn export_advanced_ui(&mut self, ui: &mut egui::Ui) {
-        form_row(ui, Key::Fps, None, |ui| {
+        let i18n = self.i18n();
+        form_row(ui, i18n, Key::Fps, None, |ui| {
             ui.add_sized(
                 [ui.available_width(), 28.0],
                 egui::DragValue::new(&mut self.options.fps).range(1..=240),
@@ -1050,6 +1153,7 @@ impl App {
         });
         combo(
             ui,
+            i18n,
             "encoder",
             Key::Encoder,
             &mut self.options.encoder,
@@ -1061,6 +1165,7 @@ impl App {
         );
         combo(
             ui,
+            i18n,
             "resolution",
             Key::Resolution,
             &mut self.options.size,
@@ -1073,6 +1178,7 @@ impl App {
         );
         combo(
             ui,
+            i18n,
             "canvas-mode",
             Key::CanvasMode,
             &mut self.options.canvas_mode,
@@ -1081,25 +1187,25 @@ impl App {
                 (CanvasMode::Initial, Key::InitialCanvas),
             ],
         );
-        form_row(ui, Key::HoldEnd, None, |ui| {
+        form_row(ui, i18n, Key::HoldEnd, None, |ui| {
             ui.add_sized(
                 [ui.available_width(), 28.0],
                 egui::DragValue::new(&mut self.options.hold_end)
                     .range(0.0..=3600.0)
                     .speed(0.1)
-                    .suffix(tr(Key::SecondsSuffix)),
+                    .suffix(i18n.tr(Key::SecondsSuffix)),
             );
         });
-        form_row(ui, Key::PreviewEnd, None, |ui| {
+        form_row(ui, i18n, Key::PreviewEnd, None, |ui| {
             ui.add_sized(
                 [ui.available_width(), 28.0],
                 egui::DragValue::new(&mut self.options.preview_end)
                     .range(0.0..=3600.0)
                     .speed(0.1)
-                    .suffix(tr(Key::SecondsSuffix)),
+                    .suffix(i18n.tr(Key::SecondsSuffix)),
             );
         });
-        form_row(ui, Key::SkipProvisional, None, |ui| {
+        form_row(ui, i18n, Key::SkipProvisional, None, |ui| {
             ui.checkbox(&mut self.options.skip_provisional, "");
         });
     }
@@ -1128,9 +1234,10 @@ impl eframe::App for App {
         }
         self.menus(ctx);
         self.font_window.show(ctx, &mut self.settings);
+        let i18n = self.i18n();
         if self.closing {
             egui::TopBottomPanel::top("closing").show(ctx, |ui| {
-                ui.label(tr(Key::FinishingBeforeExit));
+                ui.label(i18n.tr(Key::FinishingBeforeExit));
             });
         }
         egui::CentralPanel::default()
@@ -1148,7 +1255,7 @@ impl eframe::App for App {
                             );
                             ui.add_space(3.0);
                             let recording = self.recording_busy();
-                            if self.preview.show(ui, recording) {
+                            if self.preview.show(ui, i18n, recording) {
                                 self.request_preview();
                             }
                             section_break(ui);
@@ -1158,22 +1265,22 @@ impl eframe::App for App {
                         });
                     });
             });
-        egui::Window::new(tr(Key::AboutTitle))
+        egui::Window::new(i18n.tr(Key::AboutTitle))
             .open(&mut self.about)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.heading(tr(Key::ApplicationName));
+                ui.heading(i18n.tr(Key::ApplicationName));
                 ui.label(format!(
                     "{} {}",
-                    tr(Key::Version),
+                    i18n.tr(Key::Version),
                     env!("CARGO_PKG_VERSION")
                 ));
-                ui.label(tr(Key::AboutLicense));
-                ui.label(tr(Key::AboutDescription));
-                ui.label(tr(Key::AboutFree));
-                ui.label(tr(Key::AboutDistribution));
-                ui.hyperlink_to(tr(Key::Repository), REPOSITORY);
+                ui.label(i18n.tr(Key::AboutLicense));
+                ui.label(i18n.tr(Key::AboutDescription));
+                ui.label(i18n.tr(Key::AboutFree));
+                ui.label(i18n.tr(Key::AboutDistribution));
+                ui.hyperlink_to(i18n.tr(Key::Repository), REPOSITORY);
             });
         ctx.request_repaint_after(Duration::from_millis(100));
     }
@@ -1195,26 +1302,24 @@ fn clone_options(o: &Options) -> Options {
         overwrite: o.overwrite,
     }
 }
-fn duration(ms: u64) -> String {
-    let seconds = ms / 1000;
-    if seconds >= 3600 {
-        return format!(
-            "{}:{:02}:{:02}",
-            seconds / 3600,
-            seconds / 60 % 60,
-            seconds % 60
-        );
+/// Validate a recent entry before loading it. Missing paths are dropped from
+/// the list immediately so the menu does not keep offering a dead session.
+fn existing_recent_session(
+    settings: &mut Settings,
+    path: &Path,
+) -> Result<PathBuf, PathBuf> {
+    if path.is_dir() {
+        Ok(path.to_path_buf())
+    } else {
+        settings.forget_session(path);
+        Err(path.to_path_buf())
     }
-    if seconds >= 60 {
-        return format!("{}:{:02}", seconds / 60, seconds % 60);
-    }
-    let mut text = format!("0:{seconds:02}");
-    if ms % 1000 != 0 {
-        let fraction = format!("{:03}", ms % 1000);
-        text.push('.');
-        text.push_str(fraction.trim_end_matches('0'));
-    }
-    text
+}
+fn session_label(path: &Path) -> String {
+    path.file_name()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 fn section_break(ui: &mut egui::Ui) {
     ui.add_space(4.0);
@@ -1253,27 +1358,33 @@ fn centered_form<R>(
 }
 fn form_row<R>(
     ui: &mut egui::Ui,
+    i18n: Translator,
     label: Key,
     tip: Option<Key>,
     body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     ui.horizontal(|ui| {
-        let response = form_label(ui, label);
+        form_label(ui, i18n, label);
         if let Some(tip) = tip {
-            response.on_hover_text(format!("{}\n{}", tr(label), tr(tip)));
+            help_icon(ui, i18n, tip);
         }
         body(ui)
     })
     .inner
 }
-fn action_row(ui: &mut egui::Ui, open: &mut bool, action: impl FnOnce(&mut egui::Ui)) {
+fn action_row(
+    ui: &mut egui::Ui,
+    i18n: Translator,
+    open: &mut bool,
+    action: impl FnOnce(&mut egui::Ui),
+) {
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width(), 30.0),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             action(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                advanced_toggle(ui, open);
+                advanced_toggle(ui, i18n, open);
             });
         },
     );
@@ -1291,12 +1402,13 @@ fn advanced_panel(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
 }
 fn option_u64(
     ui: &mut egui::Ui,
+    i18n: Translator,
     label: Key,
     tip: Key,
     value: &mut u64,
     range: std::ops::RangeInclusive<u64>,
 ) {
-    form_row(ui, label, Some(tip), |ui| {
+    form_row(ui, i18n, label, Some(tip), |ui| {
         ui.add_sized(
             [ui.available_width(), 28.0],
             egui::DragValue::new(value).range(range).suffix(
@@ -1304,7 +1416,7 @@ fn option_u64(
                     label,
                     Key::IdleDelay | Key::MinCaptureGap | Key::MaxActiveGap
                 ) {
-                    tr(Key::MillisecondsSuffix)
+                    i18n.tr(Key::MillisecondsSuffix)
                 } else {
                     ""
                 },
@@ -1314,6 +1426,7 @@ fn option_u64(
 }
 fn combo<T: Copy + PartialEq>(
     ui: &mut egui::Ui,
+    i18n: Translator,
     id: &str,
     label: Key,
     value: &mut T,
@@ -1321,6 +1434,7 @@ fn combo<T: Copy + PartialEq>(
 ) {
     form_row(
         ui,
+        i18n,
         label,
         if label == Key::Encoder {
             Some(Key::EncoderTip)
@@ -1328,12 +1442,13 @@ fn combo<T: Copy + PartialEq>(
             None
         },
         |ui| {
-            choice_combo(ui, id, value, choices);
+            choice_combo(ui, i18n, id, value, choices);
         },
     );
 }
 fn choice_combo<T: Copy + PartialEq>(
     ui: &mut egui::Ui,
+    i18n: Translator,
     id: &str,
     value: &mut T,
     choices: &[(T, Key)],
@@ -1345,12 +1460,12 @@ fn choice_combo<T: Copy + PartialEq>(
             choices
                 .iter()
                 .find(|(v, _)| v == value)
-                .map(|(_, key)| tr(*key))
+                .map(|(_, key)| i18n.tr(*key))
                 .unwrap_or_default(),
         )
         .show_ui(ui, |ui| {
             for (v, key) in choices {
-                ui.selectable_value(value, *v, tr(*key));
+                ui.selectable_value(value, *v, i18n.tr(*key));
             }
         });
 }
@@ -1359,20 +1474,26 @@ fn choice_combo<T: Copy + PartialEq>(
 mod tests {
     use super::*;
     #[test]
-    fn video_duration_is_compact_without_trailing_zeroes() {
-        for (ms, expected) in [
-            (0, "0:00"),
-            (4_000, "0:04"),
-            (4_800, "0:04.8"),
-            (4_205, "0:04.205"),
-            (222_800, "3:42"),
-            (3_600_000, "1:00:00"),
-        ] {
-            assert_eq!(duration(ms), expected);
-        }
+    fn recent_session_labels_use_the_directory_basename() {
+        assert_eq!(
+            session_label(Path::new("/recordings/session-1793422487")),
+            "session-1793422487"
+        );
+    }
+    #[test]
+    fn a_missing_recent_session_is_removed_before_opening() {
+        let missing = PathBuf::from("/definitely/not/a/real/timelapse4sai2/session");
+        let mut settings = Settings::default();
+        settings.remember_session(missing.clone());
+        assert_eq!(
+            existing_recent_session(&mut settings, &missing),
+            Err(missing)
+        );
+        assert!(settings.recent_sessions.is_empty());
     }
     #[test]
     fn centered_form_bounds_long_controls_in_narrow_and_tiled_windows() {
+        let i18n = Translator::default();
         for screen_width in [440.0, 560.0, 1800.0] {
             let ctx = egui::Context::default();
             let mut path = "/home/example/".repeat(24);
@@ -1394,18 +1515,23 @@ mod tests {
                                 .truncate()
                                 .selected_text("Long canvas name ".repeat(40))
                                 .show_ui(ui, |_| {});
-                            form_row(ui, Key::Session, None, |ui| {
+                            form_row(ui, i18n, Key::Session, None, |ui| {
                                 let width = (ui.available_width() - 36.0).max(0.0);
                                 path_edit(ui, &mut path, width);
-                                icon_button(ui, Icon::Folder, tr(Key::ChooseDirectory), true);
+                                icon_button(
+                                    ui,
+                                    Icon::Folder,
+                                    i18n.tr(Key::ChooseDirectory),
+                                    true,
+                                );
                             });
-                            preview.show(ui, false);
+                            preview.show(ui, i18n, false);
                             let mut advanced = false;
-                            action_row(ui, &mut advanced, |ui| {
+                            action_row(ui, i18n, &mut advanced, |ui| {
                                 action_button(
                                     ui,
                                     Icon::Play,
-                                    tr(Key::StartRecording),
+                                    i18n.tr(Key::StartRecording),
                                     true,
                                     ActionStyle::Primary,
                                 );

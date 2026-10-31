@@ -1,4 +1,4 @@
-use super::i18n::{Key, tr};
+use super::i18n::{Key, Translator};
 use eframe::egui::{self, Color32, Pos2, Response, Sense, Stroke, Vec2};
 
 #[derive(Clone, Copy)]
@@ -19,11 +19,11 @@ pub enum ActionStyle {
     Stop,
 }
 
-pub fn form_label(ui: &mut egui::Ui, key: Key) -> Response {
+pub fn form_label(ui: &mut egui::Ui, i18n: Translator, key: Key) -> Response {
     let color = ui.visuals().text_color();
     let width = (ui.available_width() * 0.34).clamp(72.0, 184.0);
     let galley = ui.painter().layout(
-        tr(key).to_owned(),
+        i18n.tr(key).to_owned(),
         egui::TextStyle::Body.resolve(ui.style()),
         color,
         width,
@@ -36,19 +36,52 @@ pub fn form_label(ui: &mut egui::Ui, key: Key) -> Response {
         color,
     );
     response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), tr(key))
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), i18n.tr(key))
     });
     response
 }
 
-pub fn metrics_row(ui: &mut egui::Ui, values: &[(Key, String)], base_size: f32) {
+/// Small, quiet `?` affordance placed after a field label. The tooltip is the
+/// explanation body only; the label is already visible next to the icon.
+pub fn help_icon(ui: &mut egui::Ui, i18n: Translator, tip: Key) -> Response {
+    let size = ui.spacing().interact_size.y.min(22.0).max(18.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let color = if response.hovered() {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    if response.hovered() {
+        ui.painter()
+            .circle_stroke(rect.center(), size * 0.46, Stroke::new(1.0, color));
+    }
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "?",
+        egui::TextStyle::Small.resolve(ui.style()),
+        color,
+    );
+    let text = i18n.tr(tip);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), text)
+    });
+    response.on_hover_text(text)
+}
+
+pub fn metrics_row(
+    ui: &mut egui::Ui,
+    i18n: Translator,
+    values: &[(Key, String)],
+    base_size: f32,
+) {
     if values.is_empty() {
         return;
     }
     ui.columns(values.len(), |columns| {
         for (column, (key, value)) in columns.iter_mut().zip(values) {
             column.label(
-                egui::RichText::new(tr(*key))
+                egui::RichText::new(i18n.tr(*key))
                     .size(base_size * 12.0 / 14.5)
                     .color(column.visuals().weak_text_color()),
             );
@@ -57,12 +90,12 @@ pub fn metrics_row(ui: &mut egui::Ui, values: &[(Key, String)], base_size: f32) 
     });
 }
 
-pub fn advanced_toggle(ui: &mut egui::Ui, open: &mut bool) -> Response {
+pub fn advanced_toggle(ui: &mut egui::Ui, i18n: Translator, open: &mut bool) -> Response {
     let font = egui::TextStyle::Button.resolve(ui.style());
     let color = ui.visuals().weak_text_color();
     let galley = ui
         .painter()
-        .layout_no_wrap(tr(Key::Advanced).to_owned(), font, color);
+        .layout_no_wrap(i18n.tr(Key::Advanced).to_owned(), font, color);
     let width = galley.size().x + 24.0;
     let response = ui.add(
         egui::Button::new("")
@@ -113,7 +146,11 @@ pub fn advanced_toggle(ui: &mut egui::Ui, open: &mut bool) -> Response {
         );
     }
     response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tr(Key::Advanced))
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            i18n.tr(Key::Advanced),
+        )
     });
     response
 }

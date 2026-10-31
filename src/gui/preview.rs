@@ -1,5 +1,5 @@
 use super::{
-    i18n::{Key, tr},
+    i18n::{Key, Translator},
     widgets::{Icon, paint_icon},
 };
 use eframe::egui::{self, Color32, Vec2};
@@ -54,7 +54,7 @@ impl Preview {
 
     /// Draws a compact preview card. Returns true when the user requests a
     /// manual refresh; preview data remains owned by the caller.
-    pub fn show(&mut self, ui: &mut egui::Ui, recording: bool) -> bool {
+    pub fn show(&mut self, ui: &mut egui::Ui, i18n: Translator, recording: bool) -> bool {
         const MAX_CARD: Vec2 = Vec2::new(360.0, 240.0);
         const PLACEHOLDER_CARD: Vec2 = Vec2::new(320.0, 180.0);
         const PAD: f32 = 16.0;
@@ -102,7 +102,7 @@ impl Preview {
                 image_painter.text(
                     image.center(),
                     egui::Align2::CENTER_CENTER,
-                    tr(Key::Recording),
+                    i18n.tr(Key::Recording),
                     egui::TextStyle::Heading.resolve(ui.style()),
                     Color32::WHITE,
                 );
@@ -110,11 +110,12 @@ impl Preview {
         } else {
             let inner = card.shrink(PAD);
             if self.loading {
-                centered_message(ui, inner, tr(Key::Loading));
+                centered_message(ui, inner, i18n.tr(Key::Loading));
             } else if let Some(error) = &self.error {
-                centered_message(ui, inner, tr(Key::PreviewUnavailable)).on_hover_text(error);
+                centered_message(ui, inner, i18n.tr(Key::PreviewUnavailable))
+                    .on_hover_text(error);
             } else {
-                centered_message(ui, inner, tr(Key::PreviewEmpty));
+                centered_message(ui, inner, i18n.tr(Key::PreviewEmpty));
             }
         }
 
@@ -147,13 +148,13 @@ impl Preview {
             14.0,
             refresh_visuals.fg_stroke.color,
         );
-        let refresh = refresh.on_hover_text(format!(
-            "{}\n{}",
-            tr(Key::RefreshPreview),
-            tr(Key::PreviewRefreshTip)
-        ));
+        let refresh = refresh.on_hover_text(i18n.tr(Key::PreviewRefreshTip));
         refresh.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tr(Key::RefreshPreview))
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                enabled,
+                i18n.tr(Key::RefreshPreview),
+            )
         });
         refresh.clicked()
     }

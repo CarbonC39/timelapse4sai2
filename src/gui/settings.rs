@@ -1,14 +1,17 @@
 use std::{
-    path::PathBuf,
+    collections::HashSet,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, Once, OnceLock},
 };
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontId, TextStyle};
 use serde::{Deserialize, Serialize};
 
-use crate::gui::i18n::{Key, tr};
+use crate::gui::i18n::{Key, Language, Translator};
 
 static SYSTEM_FONTS: OnceLock<Mutex<Option<Arc<Vec<SystemFont>>>>> = OnceLock::new();
+pub const MAX_RECENT_SESSIONS: usize = 5;
+const MAX_CJK_FALLBACKS: usize = 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Theme {
@@ -27,6 +30,11 @@ pub struct Settings {
     pub font: Option<String>,
     /// Global base size in points. All egui text styles are derived from it.
     pub font_size: f32,
+    /// Defaults keep settings written by older GUI builds readable.
+    #[serde(default)]
+    pub language: Language,
+    #[serde(default)]
+    pub recent_sessions: Vec<PathBuf>,
 }
 
 impl Default for Settings {
@@ -36,6 +44,8 @@ impl Default for Settings {
             theme: Theme::System,
             font: None,
             font_size: 14.5,
+            language: Language::English,
+            recent_sessions: Vec::new(),
         }
     }
 }
@@ -49,6 +59,22 @@ impl Settings {
 
     pub fn save(&self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, self);
+    }
+
+    pub fn i18n(&self) -> Translator {
+        Translator::new(self.language)
+    }
+
+    /// Promote a successfully opened or started session to the front of the
+    /// recent list, removing duplicates and keeping only a small bounded set.
+    pub fn remember_session(&mut self, path: PathBuf) {
+        self.recent_sessions.retain(|recent| recent != &path);
+        self.recent_sessions.insert(0, path);
+        self.recent_sessions.truncate(MAX_RECENT_SESSIONS);
+    }
+
+    pub fn forget_session(&mut self, path: &Path) {
+        self.recent_sessions.retain(|recent| recent != path);
     }
 
     /// Applies theme and text sizes. Font data is handled separately so a theme or
@@ -116,24 +142,37 @@ impl Settings {
     /// Draw the View menu controls. The font picker opens a separate searchable
     /// window, keeping the menu compact even on systems with many installed fonts.
     pub fn view_menu(&mut self, ui: &mut egui::Ui, font_window: &mut FontWindow) {
-        ui.menu_button(tr(Key::Appearance), |ui| {
+        let i18n = self.i18n();
+        ui.menu_button(i18n.tr(Key::Appearance), |ui| {
             for (theme, key) in [
                 (Theme::System, Key::System),
                 (Theme::Light, Key::Light),
                 (Theme::Dark, Key::Dark),
             ] {
-                if ui.selectable_label(self.theme == theme, tr(key)).clicked() {
+                if ui.selectable_label(self.theme == theme, i18n.tr(key)).clicked() {
                     self.theme = theme;
                     ui.close();
                 }
             }
         });
-        if ui.button(tr(Key::Fonts)).clicked() {
+        if ui.button(i18n.tr(Key::Fonts)).clicked() {
             font_window.open = true;
             ui.close();
         }
-        ui.menu_button(tr(Key::Language), |ui| {
-            let _ = ui.selectable_label(true, tr(Key::English));
+        ui.menu_button(i18n.tr(Key::Language), |ui| {
+            for (language, key) in [
+                (Language::English, Key::English),
+                (Language::Japanese, Key::Japanese),
+                (Language::SimplifiedChinese, Key::SimplifiedChinese),
+            ] {
+                if ui
+                    .selectable_label(self.language == language, i18n.tr(key))
+                    .clicked()
+                {
+                    self.language = language;
+                    ui.close();
+                }
+            }
         });
     }
 }
@@ -159,35 +198,36 @@ impl FontWindow {
             return;
         }
         let previous_size = settings.font_size;
+        let i18n = settings.i18n();
         let mut open = self.open;
-        egui::Window::new(tr(Key::Fonts))
+        egui::Window::new(i18n.tr(Key::Fonts))
             .open(&mut open)
             .default_width(420.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::Slider::new(&mut settings.font_size, 10.0..=28.0)
-                            .text(tr(Key::FontSize))
+                            .text(i18n.tr(Key::FontSize))
                             .show_value(false),
                     );
                     ui.add(
                         egui::DragValue::new(&mut settings.font_size)
                             .range(10.0..=28.0)
-                            .suffix(tr(Key::PointSuffix)),
+                            .suffix(i18n.tr(Key::PointSuffix)),
                     );
                 });
                 ui.horizontal(|ui| {
-                    ui.label(tr(Key::Font));
+                    ui.label(i18n.tr(Key::Font));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.search)
-                            .hint_text(tr(Key::SearchFonts)),
+                            .hint_text(i18n.tr(Key::SearchFonts)),
                     );
                 });
                 ui.separator();
                 let query = self.search.trim().to_lowercase();
                 match system_fonts() {
                     None => {
-                        ui.label(tr(Key::FontListLoading));
+                        ui.label(i18n.tr(Key::FontListLoading));
                         ctx.request_repaint_after(std::time::Duration::from_millis(100));
                     }
                     Some(fonts) => {
@@ -198,7 +238,7 @@ impl FontWindow {
                             })
                             .collect::<Vec<_>>();
                         if ui
-                            .selectable_label(settings.font.is_none(), tr(Key::DefaultFont))
+                            .selectable_label(settings.font.is_none(), i18n.tr(Key::DefaultFont))
                             .clicked()
                             && settings.font.take().is_some()
                         {
@@ -206,7 +246,7 @@ impl FontWindow {
                             self.font_initialized = true;
                         }
                         if matching.is_empty() {
-                            ui.label(tr(Key::FontSearchNoResults));
+                            ui.label(i18n.tr(Key::FontSearchNoResults));
                         } else {
                             egui::ScrollArea::vertical()
                                 .id_salt("font-list-rows")
@@ -249,6 +289,7 @@ impl FontWindow {
 #[derive(Clone)]
 struct SystemFont {
     name: String,
+    families: Vec<String>,
     path: PathBuf,
     index: u32,
 }
@@ -274,6 +315,11 @@ fn start_font_scan() {
                     };
                     face.families.first().map(|(name, _)| SystemFont {
                         name: name.clone(),
+                        families: face
+                            .families
+                            .iter()
+                            .map(|(family, _)| family.clone())
+                            .collect(),
                         path: path.clone(),
                         index: face.index,
                     })
@@ -285,7 +331,10 @@ fn start_font_scan() {
             *SYSTEM_FONTS
                 .get_or_init(|| Mutex::new(None))
                 .lock()
-                .unwrap() = Some(shared);
+                .unwrap() = Some(shared.clone());
+            // Read the small fallback set on the scan thread so the UI thread
+            // only ever attaches already-loaded fallback data.
+            let _ = cjk_fallbacks(&shared);
         });
     })
 }
@@ -297,50 +346,68 @@ fn load_font(face: &SystemFont) -> Option<Arc<FontData>> {
     Some(Arc::new(data))
 }
 
-/// A small bounded CJK fallback set is shared across font changes. The selected
-/// font is never included in this cache, avoiding stale fallback selection.
-fn append_cjk_fallbacks(defs: &mut FontDefinitions, fonts: &[SystemFont]) {
+/// Preferred CJK families in priority order. The lists are intentionally
+/// short: a couple of common UI fonts cover Latin, Simplified Chinese, and
+/// Japanese while keeping the fallback stack bounded.
+fn preferred_cjk_families() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        &[
+            "Microsoft YaHei UI",
+            "Microsoft YaHei",
+            "Yu Gothic UI",
+            "Yu Gothic",
+            "Meiryo",
+            "MS Gothic",
+        ]
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        &[
+            "Noto Sans CJK SC",
+            "Noto Sans CJK JP",
+            "Noto Sans SC",
+            "Noto Sans JP",
+            "WenQuanYi Micro Hei",
+            "WenQuanYi Zen Hei",
+            "Droid Sans Fallback",
+        ]
+    }
+}
+
+/// A small bounded CJK fallback set is shared across font changes. Each
+/// preferred family is read at most once, and only the first few matches are
+/// kept so egui's fallback chain stays predictable.
+fn cjk_fallbacks(fonts: &[SystemFont]) -> &'static Vec<(String, Arc<FontData>)> {
     static FALLBACKS: OnceLock<Vec<(String, Arc<FontData>)>> = OnceLock::new();
-    let fallbacks = FALLBACKS.get_or_init(|| {
+    FALLBACKS.get_or_init(|| {
         let mut out = Vec::new();
-        let mut seen_paths = std::collections::HashSet::new();
-        for face in fonts {
-            if out.len() >= 2 {
+        let mut seen_paths = HashSet::new();
+        for preferred in preferred_cjk_families() {
+            if out.len() >= MAX_CJK_FALLBACKS {
                 break;
             }
-            let is_cjk = {
-                let name = face.name.to_lowercase();
-                [
-                    "cjk",
-                    "noto sans cjk",
-                    "noto serif cjk",
-                    "droid sans fallback",
-                    "wqy",
-                    "wenquanyi",
-                    "japanese",
-                    "gothic",
-                    "ming",
-                    "yahei",
-                    "simsun",
-                    "yu gothic",
-                    "malgun",
-                    "pingfang",
-                ]
-                .iter()
-                .any(|needle| name.contains(needle))
+            let face = fonts.iter().find(|face| {
+                face.families
+                    .iter()
+                    .any(|family| family.eq_ignore_ascii_case(preferred))
+            });
+            let Some(face) = face else {
+                continue;
             };
-            if !is_cjk || !seen_paths.insert(face.path.clone()) {
+            if !seen_paths.insert(face.path.clone()) {
                 continue;
             }
-            if let Ok(bytes) = std::fs::read(&face.path) {
-                let mut data = FontData::from_owned(bytes);
-                data.index = face.index;
-                out.push((format!("system-cjk-{}", out.len()), Arc::new(data)));
+            if let Some(data) = load_font(face) {
+                out.push((format!("system-cjk-{}", out.len()), data));
             }
         }
         out
-    });
-    for (name, data) in fallbacks {
+    })
+}
+
+fn append_cjk_fallbacks(defs: &mut FontDefinitions, fonts: &[SystemFont]) {
+    for (name, data) in cjk_fallbacks(fonts) {
         defs.font_data.insert(name.clone(), data.clone());
         for family in [FontFamily::Proportional, FontFamily::Monospace] {
             let stack = defs.families.entry(family).or_default();
@@ -348,5 +415,83 @@ fn append_cjk_fallbacks(defs: &mut FontDefinitions, fonts: &[SystemFont]) {
                 stack.push(name.clone());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_sessions_are_newest_first_and_deduplicated() {
+        let mut settings = Settings::default();
+        for path in ["/sessions/one", "/sessions/two", "/sessions/one"] {
+            settings.remember_session(PathBuf::from(path));
+        }
+        assert_eq!(
+            settings.recent_sessions,
+            vec![
+                PathBuf::from("/sessions/one"),
+                PathBuf::from("/sessions/two")
+            ]
+        );
+    }
+
+    #[test]
+    fn recent_sessions_are_capped_at_five() {
+        let mut settings = Settings::default();
+        for index in 0..8 {
+            settings.remember_session(PathBuf::from(format!("/sessions/{index}")));
+        }
+        assert_eq!(settings.recent_sessions.len(), MAX_RECENT_SESSIONS);
+        assert_eq!(
+            settings.recent_sessions.first(),
+            Some(&PathBuf::from("/sessions/7"))
+        );
+        assert_eq!(
+            settings.recent_sessions.last(),
+            Some(&PathBuf::from("/sessions/3"))
+        );
+    }
+
+    #[test]
+    fn forgetting_a_missing_session_removes_only_that_entry() {
+        let mut settings = Settings::default();
+        settings.remember_session(PathBuf::from("/sessions/missing"));
+        settings.remember_session(PathBuf::from("/sessions/present"));
+        settings.forget_session(Path::new("/sessions/missing"));
+        assert_eq!(
+            settings.recent_sessions,
+            vec![PathBuf::from("/sessions/present")]
+        );
+    }
+
+    #[test]
+    fn settings_without_language_or_recent_sessions_still_load() {
+        let json = r#"{
+            "layout_version": 2,
+            "theme": "Dark",
+            "font": null,
+            "font_size": 16.0
+        }"#;
+        let settings: Settings = serde_json::from_str(json).expect("old settings should load");
+        assert_eq!(settings.language, Language::English);
+        assert!(settings.recent_sessions.is_empty());
+        assert_eq!(settings.theme, Theme::Dark);
+        assert_eq!(settings.font_size, 16.0);
+    }
+
+    #[test]
+    fn language_and_recent_sessions_survive_serialization() {
+        let mut settings = Settings::default();
+        settings.language = Language::Japanese;
+        settings.remember_session(PathBuf::from("/sessions/illustration"));
+        let json = serde_json::to_string(&settings).unwrap();
+        let restored: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.language, Language::Japanese);
+        assert_eq!(
+            restored.recent_sessions,
+            vec![PathBuf::from("/sessions/illustration")]
+        );
     }
 }
