@@ -52,121 +52,119 @@ impl Preview {
         }
     }
 
-    /// Draw the preview and its refresh control. Returns true when the user
-    /// requests a manual refresh; preview data remains owned by the caller.
+    /// Draws a compact preview card. Returns true when the user requests a
+    /// manual refresh; preview data remains owned by the caller.
     pub fn show(&mut self, ui: &mut egui::Ui, recording: bool) -> bool {
-        let available = ui.available_size_before_wrap();
-        let footer_height = 34.0;
-        let footer_gap = ui.spacing().item_spacing.y;
-        let image_height = (available.y - footer_height - footer_gap).max(0.0);
-        let (image_area, _) = ui.allocate_exact_size(
-            Vec2::new(available.x.max(0.0), image_height),
-            egui::Sense::hover(),
-        );
-        let canvas = Color32::from_rgb(42, 45, 49);
-        ui.painter().rect_filled(image_area, 0.0, canvas);
+        const MAX_CARD: Vec2 = Vec2::new(360.0, 240.0);
+        const PLACEHOLDER_CARD: Vec2 = Vec2::new(320.0, 180.0);
+        const PAD: f32 = 16.0;
 
-        let padding = 32.0;
-        let inner = image_area.shrink(padding);
-        if let Some(texture) = &self.texture {
+        let available_width = ui.available_width().max(0.0);
+        let (card_size, image_size) = if let Some(texture) = &self.texture {
             let original = texture.size_vec2();
-            if original.x > 0.0 && original.y > 0.0 && inner.width() > 0.0 && inner.height() > 0.0 {
-                let scale = (inner.width() / original.x).min(inner.height() / original.y);
-                let size = original * scale;
-                let rect = egui::Rect::from_center_size(image_area.center(), size);
-                let painter = ui.painter().with_clip_rect(image_area);
-                painter.image(
-                    texture.id(),
-                    rect,
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            if original.x > 0.0 && original.y > 0.0 {
+                let image_bounds = Vec2::new(
+                    (MAX_CARD.x - PAD * 2.0).min((available_width - PAD * 2.0).max(0.0)),
+                    MAX_CARD.y - PAD * 2.0,
+                );
+                let scale = (image_bounds.x / original.x).min(image_bounds.y / original.y);
+                let image_size = original * scale;
+                (image_size + Vec2::splat(PAD * 2.0), Some(image_size))
+            } else {
+                (PLACEHOLDER_CARD, None)
+            }
+        } else {
+            (PLACEHOLDER_CARD, None)
+        };
+        let card_size = Vec2::new(card_size.x.min(available_width), card_size.y);
+        let row_size = Vec2::new(available_width, card_size.y);
+        let (row, _) = ui.allocate_exact_size(row_size, egui::Sense::hover());
+        let card = egui::Rect::from_center_size(row.center(), card_size);
+        let painter = ui.painter().with_clip_rect(card);
+        let well_color = if ui.visuals().dark_mode {
+            Color32::from_rgb(43, 46, 50)
+        } else {
+            Color32::from_rgb(235, 236, 238)
+        };
+        painter.rect_filled(card, 8.0, well_color);
+
+        if let (Some(texture), Some(image_size)) = (&self.texture, image_size) {
+            let image = egui::Rect::from_center_size(card.center(), image_size);
+            let image_painter = ui.painter().with_clip_rect(card.shrink(PAD));
+            image_painter.image(
+                texture.id(),
+                image,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            if recording {
+                image_painter.rect_filled(image, 0.0, Color32::from_black_alpha(155));
+                image_painter.text(
+                    image.center(),
+                    egui::Align2::CENTER_CENTER,
+                    tr(Key::Recording),
+                    egui::TextStyle::Heading.resolve(ui.style()),
                     Color32::WHITE,
                 );
-                if recording {
-                    painter.rect_filled(rect, 0.0, Color32::from_black_alpha(155));
-                    painter.text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        tr(Key::Recording),
-                        egui::TextStyle::Heading.resolve(ui.style()),
-                        Color32::WHITE,
-                    );
-                }
             }
-        } else if self.loading {
-            centered_message(ui, image_area, tr(Key::Loading));
-        } else if let Some(error) = &self.error {
-            centered_message(ui, image_area, tr(Key::PreviewUnavailable)).on_hover_text(error);
         } else {
-            centered_message(ui, image_area, tr(Key::PreviewEmpty));
+            let inner = card.shrink(PAD);
+            if self.loading {
+                centered_message(ui, inner, tr(Key::Loading));
+            } else if let Some(error) = &self.error {
+                centered_message(ui, inner, tr(Key::PreviewUnavailable)).on_hover_text(error);
+            } else {
+                centered_message(ui, inner, tr(Key::PreviewEmpty));
+            }
         }
 
-        let (footer, _) = ui.allocate_exact_size(
-            Vec2::new(available.x.max(0.0), footer_height),
-            egui::Sense::hover(),
+        let refresh_rect = egui::Rect::from_min_size(
+            egui::pos2(card.right() - 34.0, card.top() + 6.0),
+            Vec2::splat(28.0),
         );
-        let label = tr(Key::Refresh);
-        let tip = tr(Key::PreviewRefreshTip);
         let enabled = !self.loading;
-        let text_size = egui::TextStyle::Button.resolve(ui.style()).size;
-        let label_width = ui.fonts_mut(|fonts| {
-            fonts
-                .layout_no_wrap(
-                    label.to_owned(),
-                    egui::FontId::new(text_size, egui::FontFamily::Proportional),
-                    ui.visuals().text_color(),
-                )
-                .size()
-                .x
-        });
-        let button_width = (label_width + 52.0).clamp(118.0, 190.0).min(footer.width());
-        let button_rect =
-            egui::Rect::from_min_size(footer.left_top(), Vec2::new(button_width, footer_height));
-        let response = ui
-            .add_enabled_ui(enabled, |ui| {
-                ui.put(
-                    button_rect,
-                    egui::Button::new("").min_size(Vec2::new(button_width, footer_height)),
-                )
-            })
-            .inner;
-        let visuals = ui.style().interact(&response);
+        let refresh = ui.interact(
+            refresh_rect,
+            ui.id().with("preview-refresh"),
+            if enabled {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            },
+        );
+        let refresh_visuals = ui.style().interact(&refresh);
         ui.painter().rect(
-            response.rect,
+            refresh.rect,
             5.0,
-            visuals.bg_fill,
-            visuals.bg_stroke,
+            refresh_visuals.bg_fill,
+            refresh_visuals.bg_stroke,
             egui::StrokeKind::Inside,
         );
         paint_icon(
             ui,
             Icon::Refresh,
-            egui::pos2(response.rect.left() + 17.0, response.rect.center().y),
-            15.0,
-            visuals.fg_stroke.color,
+            refresh.rect.center(),
+            14.0,
+            refresh_visuals.fg_stroke.color,
         );
-        ui.painter().text(
-            egui::pos2(response.rect.left() + 32.0, response.rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            label,
-            egui::TextStyle::Button.resolve(ui.style()),
-            visuals.fg_stroke.color,
-        );
-        if response.has_focus() {
-            ui.painter().rect_stroke(
-                response.rect.expand(1.0),
-                visuals.corner_radius,
-                ui.visuals().selection.stroke,
-                egui::StrokeKind::Outside,
-            );
-        }
-        response
-            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
-        response.on_hover_text(tip).clicked()
+        let refresh = refresh.on_hover_text(format!(
+            "{}\n{}",
+            tr(Key::RefreshPreview),
+            tr(Key::PreviewRefreshTip)
+        ));
+        refresh.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tr(Key::RefreshPreview))
+        });
+        refresh.clicked()
     }
 }
 
 fn centered_message(ui: &egui::Ui, area: egui::Rect, message: &str) -> egui::Response {
-    let color = Color32::from_gray(205);
+    let color = if ui.visuals().dark_mode {
+        Color32::from_gray(205)
+    } else {
+        Color32::from_gray(80)
+    };
     let painter = ui.painter().with_clip_rect(area);
     let galley = painter.layout(
         message.to_owned(),

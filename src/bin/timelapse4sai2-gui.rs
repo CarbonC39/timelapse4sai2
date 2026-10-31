@@ -10,8 +10,8 @@ fn main() -> eframe::Result {
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_title(gui::APP_NAME)
                 .with_decorations(true)
-                .with_inner_size([1000.0, 820.0])
-                .with_min_inner_size([720.0, 580.0]),
+                .with_inner_size([560.0, 720.0])
+                .with_min_inner_size([440.0, 480.0]),
             ..Default::default()
         },
         Box::new(|cc| Ok(Box::new(gui::app::App::new(cc)))),

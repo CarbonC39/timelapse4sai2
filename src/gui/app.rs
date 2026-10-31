@@ -2,7 +2,10 @@ use super::{
     i18n::{Key, format_canvas, format_count, format_dimensions, format_size, format_tracked, tr},
     preview::Preview,
     settings::{FontWindow, Settings},
-    widgets::{Icon, action_button, icon_button, paint_icon},
+    widgets::{
+        ActionStyle, Icon, action_button, advanced_toggle, form_label, icon_button, metrics_row,
+        paint_icon, path_edit,
+    },
 };
 use eframe::egui;
 use std::{
@@ -96,6 +99,8 @@ pub struct App {
     preview_revision: u64,
     session_revision: u64,
     about: bool,
+    record_advanced: bool,
+    export_advanced: bool,
     closing: bool,
     dialog_open: bool,
     session_edited: bool,
@@ -105,7 +110,14 @@ pub struct App {
 }
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let settings = Settings::load(cc.storage);
+        let mut settings = Settings::load(cc.storage);
+        if settings.layout_version < 2 {
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(560.0, 720.0)));
+            settings.layout_version = 2;
+        }
         settings.apply(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
@@ -136,6 +148,8 @@ impl App {
             preview_revision: 0,
             session_revision: 0,
             about: false,
+            record_advanced: false,
+            export_advanced: false,
             closing: false,
             dialog_open: false,
             session_edited: false,
@@ -154,6 +168,16 @@ impl App {
     }
     fn export_busy(&self) -> bool {
         self.exporting == ExportState::Exporting
+    }
+    fn export_priority(&self) -> bool {
+        !self.recording_busy()
+            && (self.plan.is_some()
+                || self.exporting == ExportState::Planning
+                    && (self
+                        .summary
+                        .as_ref()
+                        .is_some_and(|summary| summary.captures > 0)
+                        || self.stats.as_ref().is_some_and(|stats| stats.captures > 0)))
     }
     fn launch(&self, task: impl FnOnce() -> Message + Send + 'static) {
         let tx = self.tx.clone();
@@ -680,6 +704,7 @@ impl App {
         ui.horizontal(|ui| {
             let size = ui.spacing().interact_size.y.max(28.0);
             egui::ComboBox::from_id_salt("canvas")
+                .truncate()
                 .width((ui.available_width() - size - ui.spacing().item_spacing.x).max(100.0))
                 .selected_text(
                     self.detected
@@ -712,16 +737,11 @@ impl App {
     }
     fn recording_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading(tr(Key::RecordingSection));
-        let busy = self.recording_busy();
-        ui.add_enabled_ui(!busy && !self.export_busy() && !self.dialog_open, |ui| {
-            ui.label(tr(Key::Session));
-            ui.horizontal(|ui| {
-                let size = ui.spacing().interact_size.y.max(28.0);
-                let width = (ui.available_width() - size - ui.spacing().item_spacing.x).max(100.0);
-                let response = ui.add_sized(
-                    [width, size],
-                    egui::TextEdit::singleline(&mut self.session_path),
-                );
+        let editable = !self.recording_busy() && !self.export_busy() && !self.dialog_open;
+        ui.add_enabled_ui(editable, |ui| {
+            form_row(ui, Key::Session, None, |ui| {
+                let width = (ui.available_width() - 28.0 - ui.spacing().item_spacing.x).max(0.0);
+                let response = path_edit(ui, &mut self.session_path, width);
                 if response.changed() {
                     self.session_edited = true;
                     self.session_revision += 1;
@@ -764,170 +784,206 @@ impl App {
             .map(|s| s.captures)
             .or_else(|| self.summary.as_ref().map(|s| s.captures))
             .unwrap_or(0);
-        let size = self
+        let bytes = self
             .stats
             .as_ref()
             .map(|s| s.disk_bytes)
             .or_else(|| self.summary.as_ref().map(|s| s.disk_bytes))
             .unwrap_or(0);
-        ui.columns(3, |columns| {
-            columns[0].weak(tr(Key::Tracked));
-            columns[0].label(format_tracked(tracked));
-            columns[1].weak(tr(Key::Captures));
-            columns[1].label(format_count(captures));
-            columns[2].weak(tr(Key::Size));
-            columns[2].label(format_size(size));
-        });
-        if let RecordingState::Error(e) = &self.recording {
-            ui.colored_label(ui.visuals().error_fg_color, e);
+        metrics_row(
+            ui,
+            &[
+                (Key::Tracked, format_tracked(tracked)),
+                (Key::Captures, format_count(captures)),
+                (Key::Size, format_size(bytes)),
+            ],
+            self.settings.font_size,
+        );
+        if let RecordingState::Error(error) = &self.recording {
+            ui.colored_label(ui.visuals().error_fg_color, error);
         }
-        for w in &self.recording_warnings {
-            ui.colored_label(ui.visuals().warn_fg_color, w);
+        for warning in &self.recording_warnings {
+            ui.colored_label(ui.visuals().warn_fg_color, warning);
         }
-        if let Some(e) = &self.session_error {
-            ui.colored_label(ui.visuals().error_fg_color, e);
+        if let Some(error) = &self.session_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
         }
         ui.add_space(6.0);
-        ui.add_enabled_ui(!busy && !self.export_busy() && !self.dialog_open, |ui| {
-            egui::CollapsingHeader::new(tr(Key::Advanced))
-                .id_salt("record-advanced")
-                .show(ui, |ui| {
-                    field_grid(ui, "record-fields", |ui| {
-                        option_u64(
-                            ui,
-                            Key::IdleDelay,
-                            Key::IdleDelayTip,
-                            &mut self.config.idle_delay_ms,
-                            0..=60000,
-                        );
-                        option_u64(
-                            ui,
-                            Key::MinCaptureGap,
-                            Key::MinCaptureGapTip,
-                            &mut self.config.min_capture_gap_ms,
-                            1..=60000,
-                        );
-                        option_u64(
-                            ui,
-                            Key::MaxActiveGap,
-                            Key::MaxActiveGapTip,
-                            &mut self.config.max_active_gap_ms,
-                            1..=600000,
-                        );
-                        help(ui, Key::ZstdLevel, Key::ZstdLevelTip);
-                        ui.add(egui::DragValue::new(&mut self.config.zstd_level).range(-7..=22));
-                        ui.end_row();
-                        option_u64(
-                            ui,
-                            Key::CheckpointInterval,
-                            Key::CheckpointIntervalTip,
-                            &mut self.config.checkpoint_every_events,
-                            0..=100000,
-                        );
-                        help(ui, Key::CheckpointRatio, Key::CheckpointRatioTip);
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.checkpoint_changed_ratio)
-                                .range(0..=100)
-                                .suffix(tr(Key::PercentSuffix)),
-                        );
-                        ui.end_row();
-                        help(ui, Key::InputWatcher, Key::InputWatcherTip);
-                        let mut watch = !self.config.no_input_watch;
-                        ui.checkbox(&mut watch, "");
-                        self.config.no_input_watch = !watch;
-                        ui.end_row();
-                    });
-                });
-        });
-        ui.add_space(6.0);
-        match &self.recording {
+        let mut advanced = self.record_advanced;
+        action_row(ui, &mut advanced, |ui| match &self.recording {
             RecordingState::Idle | RecordingState::Error(_) => {
-                let enabled = !self.export_busy()
-                    && !self.dialog_open
+                let enabled = editable
                     && self
                         .detected
                         .as_ref()
                         .is_some_and(|d| !d.canvases.is_empty());
-                if action_button(ui, Icon::Play, tr(Key::StartRecording), enabled, false).clicked()
+                let style = if self.export_priority() {
+                    ActionStyle::Secondary
+                } else {
+                    ActionStyle::Primary
+                };
+                if action_button(ui, Icon::Play, tr(Key::StartRecording), enabled, style).clicked()
                 {
                     self.start();
                 }
             }
             RecordingState::Starting | RecordingState::Recording => {
-                if action_button(ui, Icon::Stop, tr(Key::StopRecording), true, true).clicked() {
+                if action_button(
+                    ui,
+                    Icon::Stop,
+                    tr(Key::StopRecording),
+                    true,
+                    ActionStyle::Stop,
+                )
+                .clicked()
+                {
                     self.stop();
                 }
             }
             RecordingState::Stopping => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(tr(Key::Stopping));
-                });
+                ui.spinner();
+                ui.label(tr(Key::Stopping));
             }
+        });
+        self.record_advanced = advanced;
+        if advanced {
+            let editable = !self.recording_busy() && !self.export_busy() && !self.dialog_open;
+            advanced_panel(ui, |ui| {
+                ui.add_enabled_ui(editable, |ui| self.recording_advanced_ui(ui));
+            });
         }
+    }
+    fn recording_advanced_ui(&mut self, ui: &mut egui::Ui) {
+        option_u64(
+            ui,
+            Key::IdleDelay,
+            Key::IdleDelayTip,
+            &mut self.config.idle_delay_ms,
+            0..=60000,
+        );
+        option_u64(
+            ui,
+            Key::MinCaptureGap,
+            Key::MinCaptureGapTip,
+            &mut self.config.min_capture_gap_ms,
+            1..=60000,
+        );
+        option_u64(
+            ui,
+            Key::MaxActiveGap,
+            Key::MaxActiveGapTip,
+            &mut self.config.max_active_gap_ms,
+            1..=600000,
+        );
+        form_row(ui, Key::ZstdLevel, Some(Key::ZstdLevelTip), |ui| {
+            ui.add_sized(
+                [ui.available_width(), 28.0],
+                egui::DragValue::new(&mut self.config.zstd_level).range(-7..=22),
+            );
+        });
+        option_u64(
+            ui,
+            Key::CheckpointInterval,
+            Key::CheckpointIntervalTip,
+            &mut self.config.checkpoint_every_events,
+            0..=100000,
+        );
+        form_row(
+            ui,
+            Key::CheckpointRatio,
+            Some(Key::CheckpointRatioTip),
+            |ui| {
+                ui.add_sized(
+                    [ui.available_width(), 28.0],
+                    egui::DragValue::new(&mut self.config.checkpoint_changed_ratio)
+                        .range(0..=100)
+                        .suffix(tr(Key::PercentSuffix)),
+                );
+            },
+        );
+        form_row(ui, Key::InputWatcher, Some(Key::InputWatcherTip), |ui| {
+            let mut watch = !self.config.no_input_watch;
+            ui.checkbox(&mut watch, "");
+            self.config.no_input_watch = !watch;
+        });
     }
     fn export_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading(tr(Key::Export));
         let before = format!("{:?}", self.options);
         let editable = !self.recording_busy() && !self.export_busy() && !self.dialog_open;
         ui.add_enabled_ui(editable, |ui| {
-            ui.label(tr(Key::Output));
-            ui.horizontal(|ui| {
-                let size = ui.spacing().interact_size.y.max(28.0);
-                let width = (ui.available_width() - size - ui.spacing().item_spacing.x).max(100.0);
-                ui.add_sized(
-                    [width, size],
-                    egui::TextEdit::singleline(&mut self.output_path),
-                );
+            form_row(ui, Key::Output, None, |ui| {
+                let width = (ui.available_width() - 28.0 - ui.spacing().item_spacing.x).max(0.0);
+                path_edit(ui, &mut self.output_path, width);
                 if icon_button(ui, Icon::Folder, tr(Key::ChooseOutput), !self.dialog_open).clicked()
                 {
                     self.choose(Dialog::OutputPath);
                 }
             });
-            field_grid(ui, "export-main", |ui| {
-                ui.label(tr(Key::Speed));
-                ui.add(
-                    egui::DragValue::new(&mut self.options.speed)
-                        .range(0.01..=10000.0)
-                        .speed(0.1)
-                        .suffix(tr(Key::MultiplierSuffix)),
-                );
-                ui.end_row();
-                combo(
-                    ui,
-                    "quality",
-                    Key::Quality,
-                    &mut self.options.quality,
-                    &[
-                        (Quality::Draft, Key::Draft),
-                        (Quality::Balanced, Key::Balanced),
-                        (Quality::High, Key::High),
-                        (Quality::Archival, Key::Archival),
-                    ],
-                );
+            ui.columns(2, |columns| {
+                form_row(&mut columns[0], Key::Speed, None, |ui| {
+                    egui::ComboBox::from_id_salt("speed")
+                        .width(ui.available_width())
+                        .truncate()
+                        .selected_text(format!(
+                            "{}{}",
+                            self.options.speed,
+                            tr(Key::MultiplierSuffix)
+                        ))
+                        .show_ui(ui, |ui| {
+                            for speed in [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0] {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.options.speed,
+                                        speed,
+                                        format!("{speed}{}", tr(Key::MultiplierSuffix)),
+                                    )
+                                    .clicked()
+                                {
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            ui.label(tr(Key::CustomSpeed));
+                            ui.add(
+                                egui::DragValue::new(&mut self.options.speed)
+                                    .range(0.01..=10000.0)
+                                    .speed(0.1)
+                                    .suffix(tr(Key::MultiplierSuffix)),
+                            );
+                        });
+                });
+                form_row(&mut columns[1], Key::Quality, None, |ui| {
+                    choice_combo(
+                        ui,
+                        "quality",
+                        &mut self.options.quality,
+                        &[
+                            (Quality::Draft, Key::Draft),
+                            (Quality::Balanced, Key::Balanced),
+                            (Quality::High, Key::High),
+                            (Quality::Archival, Key::Archival),
+                        ],
+                    );
+                });
             });
         });
-        egui::Grid::new("plan")
-            .spacing([18.0, 5.0])
-            .min_col_width(140.0)
-            .show(ui, |ui| {
-                ui.label(tr(Key::VideoLength));
-                ui.label(
-                    self.plan
-                        .as_ref()
-                        .map(|p| duration(p.duration_ms))
-                        .unwrap_or_else(|| tr(Key::UnavailableValue).into()),
-                );
-                ui.end_row();
-                ui.label(tr(Key::Output));
-                ui.label(
-                    self.plan
-                        .as_ref()
-                        .map(|p| format_dimensions(p.output_width, p.output_height))
-                        .unwrap_or_else(|| tr(Key::UnavailableValue).into()),
-                );
-                ui.end_row();
-            });
+        ui.add_space(6.0);
+        let duration = self
+            .plan
+            .as_ref()
+            .map(|p| duration(p.duration_ms))
+            .unwrap_or_else(|| tr(Key::UnavailableValue).into());
+        let resolution = self
+            .plan
+            .as_ref()
+            .map(|p| format_dimensions(p.output_width, p.output_height))
+            .unwrap_or_else(|| tr(Key::UnavailableValue).into());
+        metrics_row(
+            ui,
+            &[(Key::Duration, duration), (Key::Resolution, resolution)],
+            self.settings.font_size,
+        );
         for warning in &self.export_warnings {
             ui.colored_label(ui.visuals().warn_fg_color, warning);
         }
@@ -954,77 +1010,98 @@ impl App {
             }
             _ => (),
         }
-        ui.add_enabled_ui(editable, |ui| {
-            egui::CollapsingHeader::new(tr(Key::Advanced))
-                .id_salt("export-advanced")
-                .show(ui, |ui| {
-                    field_grid(ui, "export-fields", |ui| {
-                        ui.label(tr(Key::Fps));
-                        ui.add(egui::DragValue::new(&mut self.options.fps).range(1..=240));
-                        ui.end_row();
-                        combo(
-                            ui,
-                            "encoder",
-                            Key::Encoder,
-                            &mut self.options.encoder,
-                            &[
-                                (Encoder::Auto, Key::Auto),
-                                (Encoder::Nvenc, Key::Nvenc),
-                                (Encoder::X264, Key::X264),
-                            ],
-                        );
-                        combo(
-                            ui,
-                            "resolution",
-                            Key::Resolution,
-                            &mut self.options.size,
-                            &[
-                                (Size::Auto, Key::Auto),
-                                (Size::P1080, Key::P1080),
-                                (Size::P1440, Key::P1440),
-                                (Size::P2160, Key::P2160),
-                            ],
-                        );
-                        combo(
-                            ui,
-                            "canvas-mode",
-                            Key::CanvasMode,
-                            &mut self.options.canvas_mode,
-                            &[
-                                (CanvasMode::Max, Key::MaxCanvas),
-                                (CanvasMode::Initial, Key::InitialCanvas),
-                            ],
-                        );
-                        ui.label(tr(Key::HoldEnd));
-                        ui.add(
-                            egui::DragValue::new(&mut self.options.hold_end)
-                                .range(0.0..=3600.0)
-                                .speed(0.1)
-                                .suffix(tr(Key::SecondsSuffix)),
-                        );
-                        ui.end_row();
-                        ui.label(tr(Key::PreviewEnd));
-                        ui.add(
-                            egui::DragValue::new(&mut self.options.preview_end)
-                                .range(0.0..=3600.0)
-                                .speed(0.1)
-                                .suffix(tr(Key::SecondsSuffix)),
-                        );
-                        ui.end_row();
-                        ui.label(tr(Key::SkipProvisional));
-                        ui.checkbox(&mut self.options.skip_provisional, "");
-                        ui.end_row();
-                    });
-                });
+        ui.add_space(6.0);
+        let mut advanced = self.export_advanced;
+        action_row(ui, &mut advanced, |ui| {
+            let style = if self.export_priority() {
+                ActionStyle::Primary
+            } else {
+                ActionStyle::Secondary
+            };
+            if action_button(
+                ui,
+                Icon::Export,
+                tr(Key::ExportVideo),
+                editable && self.plan.is_some(),
+                style,
+            )
+            .clicked()
+            {
+                self.choose(Dialog::Output);
+            }
         });
+        self.export_advanced = advanced;
+        if advanced {
+            let editable = !self.recording_busy() && !self.export_busy() && !self.dialog_open;
+            advanced_panel(ui, |ui| {
+                ui.add_enabled_ui(editable, |ui| self.export_advanced_ui(ui));
+            });
+        }
         if before != format!("{:?}", self.options) {
             self.request_plan();
         }
-        ui.add_space(6.0);
-        let enabled = editable && self.plan.is_some();
-        if action_button(ui, Icon::Export, tr(Key::ExportVideo), enabled, false).clicked() {
-            self.choose(Dialog::Output);
-        }
+    }
+    fn export_advanced_ui(&mut self, ui: &mut egui::Ui) {
+        form_row(ui, Key::Fps, None, |ui| {
+            ui.add_sized(
+                [ui.available_width(), 28.0],
+                egui::DragValue::new(&mut self.options.fps).range(1..=240),
+            );
+        });
+        combo(
+            ui,
+            "encoder",
+            Key::Encoder,
+            &mut self.options.encoder,
+            &[
+                (Encoder::Auto, Key::Auto),
+                (Encoder::Nvenc, Key::Nvenc),
+                (Encoder::X264, Key::X264),
+            ],
+        );
+        combo(
+            ui,
+            "resolution",
+            Key::Resolution,
+            &mut self.options.size,
+            &[
+                (Size::Auto, Key::Auto),
+                (Size::P1080, Key::P1080),
+                (Size::P1440, Key::P1440),
+                (Size::P2160, Key::P2160),
+            ],
+        );
+        combo(
+            ui,
+            "canvas-mode",
+            Key::CanvasMode,
+            &mut self.options.canvas_mode,
+            &[
+                (CanvasMode::Max, Key::MaxCanvas),
+                (CanvasMode::Initial, Key::InitialCanvas),
+            ],
+        );
+        form_row(ui, Key::HoldEnd, None, |ui| {
+            ui.add_sized(
+                [ui.available_width(), 28.0],
+                egui::DragValue::new(&mut self.options.hold_end)
+                    .range(0.0..=3600.0)
+                    .speed(0.1)
+                    .suffix(tr(Key::SecondsSuffix)),
+            );
+        });
+        form_row(ui, Key::PreviewEnd, None, |ui| {
+            ui.add_sized(
+                [ui.available_width(), 28.0],
+                egui::DragValue::new(&mut self.options.preview_end)
+                    .range(0.0..=3600.0)
+                    .speed(0.1)
+                    .suffix(tr(Key::SecondsSuffix)),
+            );
+        });
+        form_row(ui, Key::SkipProvisional, None, |ui| {
+            ui.checkbox(&mut self.options.skip_provisional, "");
+        });
     }
 }
 impl eframe::App for App {
@@ -1056,29 +1133,31 @@ impl eframe::App for App {
                 ui.label(tr(Key::FinishingBeforeExit));
             });
         }
-        let controls_width = ctx.available_rect().width() * 0.60;
-        egui::SidePanel::left("controls")
-            .resizable(false)
-            .exact_width(controls_width)
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(10.0))
             .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 5.0;
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_enabled_ui(
-                        !self.recording_busy() && !self.export_busy() && !self.dialog_open,
-                        |ui| self.source_ui(ui),
-                    );
-                    ui.add_space(18.0);
-                    self.recording_ui(ui);
-                    ui.add_space(18.0);
-                    self.export_ui(ui);
-                });
+                ui.spacing_mut().item_spacing.y = 4.0;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        centered_form(ui, |ui| {
+                            ui.spacing_mut().interact_size.y = 28.0;
+                            ui.add_enabled_ui(
+                                !self.recording_busy() && !self.export_busy() && !self.dialog_open,
+                                |ui| self.source_ui(ui),
+                            );
+                            ui.add_space(3.0);
+                            let recording = self.recording_busy();
+                            if self.preview.show(ui, recording) {
+                                self.request_preview();
+                            }
+                            section_break(ui);
+                            self.recording_ui(ui);
+                            section_break(ui);
+                            self.export_ui(ui);
+                        });
+                    });
             });
-        let recording = self.recording_busy();
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.preview.show(ui, recording) {
-                self.request_preview();
-            }
-        });
         egui::Window::new(tr(Key::AboutTitle))
             .open(&mut self.about)
             .collapsible(false)
@@ -1118,39 +1197,97 @@ fn clone_options(o: &Options) -> Options {
 }
 fn duration(ms: u64) -> String {
     let seconds = ms / 1000;
-    let mut text = if seconds >= 3600 {
-        format!(
+    if seconds >= 3600 {
+        return format!(
             "{}:{:02}:{:02}",
             seconds / 3600,
             seconds / 60 % 60,
             seconds % 60
-        )
-    } else {
-        format!("{}:{:02}", seconds / 60, seconds % 60)
-    };
+        );
+    }
+    if seconds >= 60 {
+        return format!("{}:{:02}", seconds / 60, seconds % 60);
+    }
+    let mut text = format!("0:{seconds:02}");
     if ms % 1000 != 0 {
-        text.push_str(&format!(".{:03}", ms % 1000));
+        let fraction = format!("{:03}", ms % 1000);
+        text.push('.');
+        text.push_str(fraction.trim_end_matches('0'));
     }
     text
+}
+fn section_break(ui: &mut egui::Ui) {
+    ui.add_space(4.0);
+    ui.scope(|ui| {
+        ui.visuals_mut().widgets.noninteractive.bg_stroke.color = if ui.visuals().dark_mode {
+            egui::Color32::from_gray(52)
+        } else {
+            egui::Color32::from_gray(216)
+        };
+        ui.separator();
+    });
+    ui.add_space(4.0);
 }
 fn canvas_label(c: &Canvas) -> String {
     format_canvas(&c.name, c.width, c.height)
 }
-fn help(ui: &mut egui::Ui, label: Key, tip: Key) {
-    ui.horizontal(|ui| {
-        ui.label(tr(label));
-        ui.weak(tr(Key::QuestionMark)).on_hover_text(tr(tip));
-    });
+fn centered_form<R>(
+    ui: &mut egui::Ui,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let width = ui.available_width().min(540.0);
+    let inset = ((ui.available_width() - width) * 0.5).max(0.0);
+    ui.horizontal_top(|ui| {
+        ui.add_space(inset);
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_min_width(width);
+                ui.set_max_width(width);
+                body(ui)
+            },
+        )
+    })
+    .inner
 }
-fn field_grid(ui: &mut egui::Ui, id: &str, body: impl FnOnce(&mut egui::Ui)) {
-    ui.scope(|ui| {
-        ui.spacing_mut().interact_size.x = 140.0;
-        egui::Grid::new(id)
-            .num_columns(2)
-            .min_col_width(140.0)
-            .spacing([18.0, 6.0])
-            .show(ui, body);
-    });
+fn form_row<R>(
+    ui: &mut egui::Ui,
+    label: Key,
+    tip: Option<Key>,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.horizontal(|ui| {
+        let response = form_label(ui, label);
+        if let Some(tip) = tip {
+            response.on_hover_text(format!("{}\n{}", tr(label), tr(tip)));
+        }
+        body(ui)
+    })
+    .inner
+}
+fn action_row(ui: &mut egui::Ui, open: &mut bool, action: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), 30.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            action(ui);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                advanced_toggle(ui, open);
+            });
+        },
+    );
+}
+fn advanced_panel(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(4.0);
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .corner_radius(6.0)
+        .inner_margin(10.0)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            body(ui);
+        });
 }
 fn option_u64(
     ui: &mut egui::Ui,
@@ -1159,18 +1296,21 @@ fn option_u64(
     value: &mut u64,
     range: std::ops::RangeInclusive<u64>,
 ) {
-    help(ui, label, tip);
-    ui.add(egui::DragValue::new(value).range(range).suffix(
-        if matches!(
-            label,
-            Key::IdleDelay | Key::MinCaptureGap | Key::MaxActiveGap
-        ) {
-            tr(Key::MillisecondsSuffix)
-        } else {
-            ""
-        },
-    ));
-    ui.end_row();
+    form_row(ui, label, Some(tip), |ui| {
+        ui.add_sized(
+            [ui.available_width(), 28.0],
+            egui::DragValue::new(value).range(range).suffix(
+                if matches!(
+                    label,
+                    Key::IdleDelay | Key::MinCaptureGap | Key::MaxActiveGap
+                ) {
+                    tr(Key::MillisecondsSuffix)
+                } else {
+                    ""
+                },
+            ),
+        );
+    });
 }
 fn combo<T: Copy + PartialEq>(
     ui: &mut egui::Ui,
@@ -1179,18 +1319,33 @@ fn combo<T: Copy + PartialEq>(
     value: &mut T,
     choices: &[(T, Key)],
 ) {
-    if label == Key::Encoder {
-        help(ui, label, Key::EncoderTip);
-    } else {
-        ui.label(tr(label));
-    }
+    form_row(
+        ui,
+        label,
+        if label == Key::Encoder {
+            Some(Key::EncoderTip)
+        } else {
+            None
+        },
+        |ui| {
+            choice_combo(ui, id, value, choices);
+        },
+    );
+}
+fn choice_combo<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    id: &str,
+    value: &mut T,
+    choices: &[(T, Key)],
+) {
     egui::ComboBox::from_id_salt(id)
-        .width(140.0)
+        .width(ui.available_width())
+        .truncate()
         .selected_text(
             choices
                 .iter()
                 .find(|(v, _)| v == value)
-                .map(|(_, k)| tr(*k))
+                .map(|(_, key)| tr(*key))
                 .unwrap_or_default(),
         )
         .show_ui(ui, |ui| {
@@ -1198,5 +1353,77 @@ fn combo<T: Copy + PartialEq>(
                 ui.selectable_value(value, *v, tr(*key));
             }
         });
-    ui.end_row();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn video_duration_is_compact_without_trailing_zeroes() {
+        for (ms, expected) in [
+            (0, "0:00"),
+            (4_000, "0:04"),
+            (4_800, "0:04.8"),
+            (4_205, "0:04.205"),
+            (222_800, "3:42"),
+            (3_600_000, "1:00:00"),
+        ] {
+            assert_eq!(duration(ms), expected);
+        }
+    }
+    #[test]
+    fn centered_form_bounds_long_controls_in_narrow_and_tiled_windows() {
+        for screen_width in [440.0, 560.0, 1800.0] {
+            let ctx = egui::Context::default();
+            let mut path = "/home/example/".repeat(24);
+            let mut preview = Preview::default();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(screen_width, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let available = ui.available_rect_before_wrap();
+                        let form = centered_form(ui, |ui| {
+                            egui::ComboBox::from_id_salt("long-canvas")
+                                .width(ui.available_width())
+                                .truncate()
+                                .selected_text("Long canvas name ".repeat(40))
+                                .show_ui(ui, |_| {});
+                            form_row(ui, Key::Session, None, |ui| {
+                                let width = (ui.available_width() - 36.0).max(0.0);
+                                path_edit(ui, &mut path, width);
+                                icon_button(ui, Icon::Folder, tr(Key::ChooseDirectory), true);
+                            });
+                            preview.show(ui, false);
+                            let mut advanced = false;
+                            action_row(ui, &mut advanced, |ui| {
+                                action_button(
+                                    ui,
+                                    Icon::Play,
+                                    tr(Key::StartRecording),
+                                    true,
+                                    ActionStyle::Primary,
+                                );
+                            });
+                        });
+                        assert!(
+                            form.response.rect.width() <= 540.5,
+                            "form expanded at {screen_width}: {:?}",
+                            form.response.rect
+                        );
+                        assert!(
+                            (form.response.rect.center().x - available.center().x).abs() <= 1.0,
+                            "form not centered at {screen_width}: {:?}",
+                            form.response.rect
+                        );
+                    });
+                },
+            );
+        }
+    }
 }

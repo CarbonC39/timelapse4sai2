@@ -1,3 +1,4 @@
+use super::i18n::{Key, tr};
 use eframe::egui::{self, Color32, Pos2, Response, Sense, Stroke, Vec2};
 
 #[derive(Clone, Copy)]
@@ -9,6 +10,112 @@ pub enum Icon {
     Export,
     Check,
     Warning,
+}
+
+#[derive(Clone, Copy)]
+pub enum ActionStyle {
+    Primary,
+    Secondary,
+    Stop,
+}
+
+pub fn form_label(ui: &mut egui::Ui, key: Key) -> Response {
+    let color = ui.visuals().text_color();
+    let width = (ui.available_width() * 0.34).clamp(72.0, 184.0);
+    let galley = ui.painter().layout(
+        tr(key).to_owned(),
+        egui::TextStyle::Body.resolve(ui.style()),
+        color,
+        width,
+    );
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, galley.size().y.max(28.0)), Sense::hover());
+    ui.painter().galley(
+        egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5),
+        galley,
+        color,
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), tr(key))
+    });
+    response
+}
+
+pub fn metrics_row(ui: &mut egui::Ui, values: &[(Key, String)], base_size: f32) {
+    if values.is_empty() {
+        return;
+    }
+    ui.columns(values.len(), |columns| {
+        for (column, (key, value)) in columns.iter_mut().zip(values) {
+            column.label(
+                egui::RichText::new(tr(*key))
+                    .size(base_size * 12.0 / 14.5)
+                    .color(column.visuals().weak_text_color()),
+            );
+            column.label(egui::RichText::new(value).size(base_size * 15.0 / 14.5));
+        }
+    });
+}
+
+pub fn advanced_toggle(ui: &mut egui::Ui, open: &mut bool) -> Response {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let color = ui.visuals().weak_text_color();
+    let galley = ui
+        .painter()
+        .layout_no_wrap(tr(Key::Advanced).to_owned(), font, color);
+    let width = galley.size().x + 24.0;
+    let response = ui.add(
+        egui::Button::new("")
+            .frame(false)
+            .min_size(Vec2::new(width, 28.0)),
+    );
+    if response.clicked() {
+        *open = !*open;
+    }
+    let color = if response.hovered() {
+        ui.visuals().text_color()
+    } else {
+        color
+    };
+    let center = egui::pos2(response.rect.left() + 8.0, response.rect.center().y);
+    let offsets = if *open {
+        [
+            Vec2::new(-4.0, -2.0),
+            Vec2::new(4.0, -2.0),
+            Vec2::new(0.0, 3.0),
+        ]
+    } else {
+        [
+            Vec2::new(-2.0, -4.0),
+            Vec2::new(-2.0, 4.0),
+            Vec2::new(3.0, 0.0),
+        ]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(
+        offsets.into_iter().map(|p| center + p).collect(),
+        color,
+        Stroke::NONE,
+    ));
+    ui.painter().galley(
+        egui::pos2(
+            response.rect.left() + 20.0,
+            response.rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        color,
+    );
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect,
+            4.0,
+            ui.visuals().selection.stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tr(Key::Advanced))
+    });
+    response
 }
 
 pub fn paint_icon(ui: &egui::Ui, icon: Icon, center: Pos2, size: f32, color: Color32) {
@@ -112,13 +219,13 @@ pub fn action_button(
     icon: Icon,
     label: &str,
     enabled: bool,
-    stop: bool,
+    style: ActionStyle,
 ) -> Response {
-    let height = (ui.text_style_height(&egui::TextStyle::Button) + 14.0).clamp(32.0, 34.0);
-    let color = if stop {
-        Color32::from_rgb(177, 48, 54)
-    } else {
-        Color32::from_rgb(38, 105, 180)
+    let height = (ui.text_style_height(&egui::TextStyle::Button) + 10.0).clamp(28.0, 30.0);
+    let accent = match style {
+        ActionStyle::Primary => Color32::from_rgb(38, 105, 180),
+        ActionStyle::Stop => Color32::from_rgb(177, 48, 54),
+        ActionStyle::Secondary => ui.visuals().widgets.inactive.bg_fill,
     };
     let font = egui::TextStyle::Button.resolve(ui.style());
     let label_width = ui.fonts_mut(|fonts| {
@@ -127,26 +234,38 @@ pub fn action_button(
             .size()
             .x
     });
-    let width = (label_width + 62.0).max(150.0).min(ui.available_width());
+    let width = (label_width + 58.0)
+        .max(130.0)
+        .min(ui.available_width().max(0.0));
+    let secondary = matches!(style, ActionStyle::Secondary);
     let response = ui.add_enabled(
         enabled,
         egui::Button::new("")
-            .fill(if enabled {
-                color
+            .fill(if secondary {
+                ui.visuals().widgets.inactive.bg_fill
+            } else if enabled {
+                accent
             } else {
                 ui.visuals().widgets.inactive.bg_fill
+            })
+            .stroke(if secondary {
+                ui.visuals().widgets.inactive.bg_stroke
+            } else {
+                Stroke::NONE
             })
             .min_size(egui::vec2(width, height)),
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
-    let text_color = if enabled {
-        Color32::WHITE
-    } else {
+    let text_color = if !enabled {
         ui.visuals().weak_text_color()
+    } else if secondary {
+        ui.visuals().text_color()
+    } else {
+        Color32::WHITE
     };
     let painter = ui.painter().with_clip_rect(response.rect);
-    if enabled && response.hovered() {
-        painter.rect_filled(response.rect, 4.0, color.gamma_multiply(1.12));
+    if enabled && response.hovered() && !secondary {
+        painter.rect_filled(response.rect, 4.0, accent.gamma_multiply(1.12));
     }
     paint_icon(
         ui,
@@ -171,4 +290,27 @@ pub fn action_button(
         );
     }
     response
+}
+
+pub fn path_edit(ui: &mut egui::Ui, value: &mut String, width: f32) -> Response {
+    ui.scope(|ui| {
+        let background = if ui.visuals().dark_mode {
+            Color32::from_rgb(35, 38, 42)
+        } else {
+            Color32::from_rgb(235, 236, 238)
+        };
+        ui.visuals_mut().text_edit_bg_color = Some(background);
+        let border = if ui.visuals().dark_mode {
+            Color32::from_gray(65)
+        } else {
+            Color32::from_gray(190)
+        };
+        ui.visuals_mut().widgets.inactive.bg_stroke.color = border;
+        ui.visuals_mut().widgets.hovered.bg_stroke.color = border;
+        ui.add_sized(
+            Vec2::new(width.max(0.0), ui.spacing().interact_size.y.max(28.0)),
+            egui::TextEdit::singleline(value),
+        )
+    })
+    .inner
 }

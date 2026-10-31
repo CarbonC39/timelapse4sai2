@@ -20,6 +20,8 @@ pub enum Theme {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default)]
+    pub layout_version: u32,
     pub theme: Theme,
     /// `None` uses egui's built in font stack.
     pub font: Option<String>,
@@ -30,6 +32,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            layout_version: 2,
             theme: Theme::System,
             font: None,
             font_size: 14.5,
@@ -74,7 +77,7 @@ impl Settings {
                 (TextStyle::Small, 0.85, FontFamily::Proportional),
                 (TextStyle::Body, 1.0, FontFamily::Proportional),
                 (TextStyle::Button, 1.0, FontFamily::Proportional),
-                (TextStyle::Heading, 20.0 / 14.5, FontFamily::Proportional),
+                (TextStyle::Heading, 19.0 / 14.5, FontFamily::Proportional),
                 (TextStyle::Monospace, 1.0, FontFamily::Monospace),
             ] {
                 style
