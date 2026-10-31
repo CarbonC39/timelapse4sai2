@@ -15,30 +15,14 @@ impl SaiGeneration {
 #[derive(Debug, Clone, Copy)]
 pub enum RootLocator {
     FixedRva(usize),
+    Signature(super::signature::SignatureLocator<'static>),
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct CanvasLayout {
-    pub next_offset: usize,
-    pub id_offset: Option<usize>,
-    pub width_offset: usize,
-    pub height_offset: usize,
-    pub name_offset: usize,
-    pub short_path_offset: usize,
-    pub string_bytes: usize,
-    pub tiles: TileLayout,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct TileLayout {
-    /// Inline array entry for level 0: canvas -> slot -> map -> row tree.
-    pub level0_offset: usize,
-    pub canvas_grid_offsets: Option<(usize, usize)>,
-    pub tree_offset: usize,
-    pub width_offset: usize,
-    pub height_offset: usize,
-    pub nx_offset: usize,
-    pub ny_offset: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatibilityStatus {
+    ExactKnownBuild,
+    SignatureValidated,
+    Unsupported,
 }
 
 #[derive(Debug)]
@@ -46,7 +30,7 @@ pub struct SaiProfile {
     pub display_name: &'static str,
     pub executable_hash: &'static str,
     pub generation: SaiGeneration,
-    pub layout: &'static CanvasLayout,
+    pub layout: &'static super::layouts::CanvasLayout,
     pub locator: RootLocator,
 }
 
@@ -59,8 +43,8 @@ pub fn identify(hash: &str) -> Result<&'static SaiProfile, String> {
 }
 
 pub static KNOWN_BUILDS: &[&SaiProfile] = &[
-    &super::preview_2026_07_02b::PROFILE,
-    &super::renovated_2026_10_19::PROFILE,
+    &super::builds::preview_2026_07_02b::PROFILE,
+    &super::builds::renovated_2026_10_19::PROFILE,
 ];
 
 #[cfg(test)]

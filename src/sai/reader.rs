@@ -22,6 +22,8 @@ pub struct Reader<'a, M: ProcessMemory> {
     pub memory: &'a M,
     pub base: usize,
     pub profile: &'static SaiProfile,
+    pub resolved_root_rva: Option<usize>,
+    pub source_hash: Option<&'a str>,
 }
 impl<M: ProcessMemory> Reader<'_, M> {
     fn bytes<const N: usize>(&self, address: usize) -> Result<[u8; N], String> {
@@ -88,7 +90,12 @@ impl<M: ProcessMemory> Reader<'_, M> {
     }
     pub fn canvases(&self) -> Result<Vec<Canvas>, String> {
         // Original get_canvas_list(): read the sentinel pointer, collect, discard sentinel.
-        let RootLocator::FixedRva(rva) = self.profile.locator;
+        let rva = match (self.resolved_root_rva, self.profile.locator) {
+            (Some(rva), _) | (None, RootLocator::FixedRva(rva)) => rva,
+            (None, RootLocator::Signature(_)) => {
+                return Err("signature root has not been resolved".into());
+            }
+        };
         let sentinel = self.required_ptr(Self::at(self.base, rva)?)?;
         let mut p = self.ptr(Self::at(sentinel, self.profile.layout.next_offset)?)?;
         let mut seen = HashSet::from([sentinel]);
@@ -104,6 +111,17 @@ impl<M: ProcessMemory> Reader<'_, M> {
             p = self.ptr(Self::at(p, self.profile.layout.next_offset)?)?;
         }
         Ok(result)
+    }
+    /// Unknown builds must expose at least one structurally valid canvas before capture.
+    pub fn validate_runtime_layout(&self) -> Result<Vec<Canvas>, String> {
+        let canvases = self.canvases()?;
+        if canvases.is_empty() {
+            return Err("cannot validate Renovated layout without an open canvas".into());
+        }
+        for canvas in &canvases {
+            self.read_tile_map(canvas)?;
+        }
+        Ok(canvases)
     }
     pub fn read_tile_map(&self, canvas: &Canvas) -> Result<TileMap, String> {
         let l = self.profile.layout.tiles;
@@ -225,7 +243,7 @@ impl<M: ProcessMemory> Reader<'_, M> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::sai::preview_2026_07_02b::{PROFILE, SESSION_OFFSET};
+    use crate::sai::builds::preview_2026_07_02b::{PROFILE, SESSION_OFFSET};
 
     pub(crate) const BASE: usize = 0x100;
     pub(crate) const SENTINEL: usize = 0x1000;
@@ -342,6 +360,8 @@ pub(crate) mod tests {
     fn composites_and_crops_two_bgra_tiles_and_skips_sentinel() {
         let mem = fixture();
         let reader = Reader {
+            resolved_root_rva: None,
+            source_hash: None,
             memory: &mem,
             base: BASE,
             profile: &PROFILE,
@@ -368,6 +388,8 @@ pub(crate) mod tests {
         let mut mem = fixture();
         mem.u32(MAP + 0x18, 1);
         let reader = Reader {
+            resolved_root_rva: None,
+            source_hash: None,
             memory: &mem,
             base: BASE,
             profile: &PROFILE,
@@ -386,6 +408,8 @@ pub(crate) mod tests {
         let mut mem = fixture();
         mem.ptr(CANVAS, CANVAS);
         let reader = Reader {
+            resolved_root_rva: None,
+            source_hash: None,
             memory: &mem,
             base: BASE,
             profile: &PROFILE,
@@ -400,10 +424,12 @@ pub(crate) mod tests {
 
     #[test]
     fn renovated_profile_reads_and_composites_expected_pixels() {
-        use crate::sai::renovated_2026_10_19::PROFILE as RENOVATED;
+        use crate::sai::builds::renovated_2026_10_19::PROFILE as RENOVATED;
 
         let mem = renovated_fixture();
         let reader = Reader {
+            resolved_root_rva: None,
+            source_hash: None,
             memory: &mem,
             base: BASE,
             profile: &RENOVATED,
@@ -423,6 +449,8 @@ pub(crate) mod tests {
     fn fixture_reader_rgb() -> Vec<u8> {
         let mem = fixture();
         let reader = Reader {
+            resolved_root_rva: None,
+            source_hash: None,
             memory: &mem,
             base: BASE,
             profile: &PROFILE,
@@ -435,6 +463,8 @@ pub(crate) mod tests {
     fn renovated_fixture_rejects_legacy_profile() {
         let mem = renovated_fixture();
         let reader = Reader {
+            resolved_root_rva: None,
+            source_hash: None,
             memory: &mem,
             base: BASE,
             profile: &PROFILE,
@@ -444,11 +474,13 @@ pub(crate) mod tests {
 
     #[test]
     fn renovated_reader_rejects_canvas_map_grid_mismatch() {
-        use crate::sai::renovated_2026_10_19::PROFILE as RENOVATED;
+        use crate::sai::builds::renovated_2026_10_19::PROFILE as RENOVATED;
 
         let mut mem = renovated_fixture();
         mem.u32(CANVAS + 0x180, 1);
         let reader = Reader {
+            resolved_root_rva: None,
+            source_hash: None,
             memory: &mem,
             base: BASE,
             profile: &RENOVATED,
@@ -463,12 +495,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn signature_root_requires_runtime_layout_validation() {
+        use crate::sai::builds::renovated_2026_10_19::SIGNATURE_PROFILE;
+
+        let mut mem = renovated_fixture();
+        let reader = Reader {
+            memory: &mem,
+            base: BASE,
+            profile: &SIGNATURE_PROFILE,
+            resolved_root_rva: Some(0x47a380),
+            source_hash: None,
+        };
+        assert_eq!(reader.validate_runtime_layout().unwrap().len(), 1);
+
+        mem.u32(MAP + 0x18, 1);
+        let reader = Reader {
+            memory: &mem,
+            base: BASE,
+            profile: &SIGNATURE_PROFILE,
+            resolved_root_rva: Some(0x47a380),
+            source_hash: None,
+        };
+        assert!(reader.validate_runtime_layout().is_err());
+    }
+
+    #[test]
     fn renovated_reader_detects_pointer_and_metadata_changes() {
-        use crate::sai::renovated_2026_10_19::PROFILE as RENOVATED;
+        use crate::sai::builds::renovated_2026_10_19::PROFILE as RENOVATED;
 
         let mut mem = renovated_fixture();
         let (_canvas, map) = {
             let reader = Reader {
+                resolved_root_rva: None,
+                source_hash: None,
                 memory: &mem,
                 base: BASE,
                 profile: &RENOVATED,
@@ -481,6 +540,8 @@ pub(crate) mod tests {
 
         mem.ptr(SLOT, TILE0);
         let reader = Reader {
+            resolved_root_rva: None,
+            source_hash: None,
             memory: &mem,
             base: BASE,
             profile: &RENOVATED,
@@ -495,6 +556,8 @@ pub(crate) mod tests {
         mem.ptr(SLOT, MAP);
         let (canvas, stable_map) = {
             let reader = Reader {
+                resolved_root_rva: None,
+                source_hash: None,
                 memory: &mem,
                 base: BASE,
                 profile: &RENOVATED,
@@ -505,6 +568,8 @@ pub(crate) mod tests {
         };
         mem.ptr(MAP + 8, ROW);
         let reader = Reader {
+            resolved_root_rva: None,
+            source_hash: None,
             memory: &mem,
             base: BASE,
             profile: &RENOVATED,
@@ -546,9 +611,11 @@ pub(crate) mod tests {
                 replacement,
             };
             let reader = Reader {
+                resolved_root_rva: None,
+                source_hash: None,
                 memory: &memory,
                 base: BASE,
-                profile: &crate::sai::renovated_2026_10_19::PROFILE,
+                profile: &crate::sai::builds::renovated_2026_10_19::PROFILE,
             };
             let canvas = reader.canvases().unwrap().remove(0);
             assert!(

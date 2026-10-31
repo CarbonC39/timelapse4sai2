@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     recorder::storage::Event,
-    sai::{preview_2026_07_02b::PROFILE, reader::Reader, reader::tests as fixture},
+    sai::{builds::preview_2026_07_02b::PROFILE, reader::Reader, reader::tests as fixture},
 };
 use std::{fs, path::PathBuf, sync::mpsc};
 
@@ -38,6 +38,8 @@ fn fixture_reader(
     mem: &fixture::FakeMemory,
 ) -> (Reader<'_, fixture::FakeMemory>, crate::sai::canvas::Canvas) {
     let reader = Reader {
+        resolved_root_rva: None,
+        source_hash: None,
         memory: mem,
         base: fixture::BASE,
         profile: &PROFILE,
@@ -219,6 +221,8 @@ fn missing_canvas_stops_capture_before_sending_a_candidate() {
     let mut capture = CaptureState::default();
     mem.ptr(fixture::SENTINEL, 0);
     let reader = Reader {
+        resolved_root_rva: None,
+        source_hash: None,
         memory: &mem,
         base: fixture::BASE,
         profile: &PROFILE,
@@ -519,7 +523,7 @@ fn reopening_reports_corrupt_blob_record_and_missing_referenced_blob() {
 
 #[test]
 fn both_profiles_share_capture_storage_and_offline_replay() {
-    use crate::sai::{preview_2026_07_02b, renovated_2026_10_19};
+    use crate::sai::builds::{preview_2026_07_02b, renovated_2026_10_19};
     let mut states = Vec::new();
     for (profile, mut mem) in [
         (&preview_2026_07_02b::PROFILE, fixture::fixture()),
@@ -531,6 +535,8 @@ fn both_profiles_share_capture_storage_and_offline_replay() {
         let mut metrics = Metrics::default();
         let mut store = {
             let reader = Reader {
+                resolved_root_rva: None,
+                source_hash: None,
                 memory: &mem,
                 base: fixture::BASE,
                 profile,
@@ -550,6 +556,8 @@ fn both_profiles_share_capture_storage_and_offline_replay() {
                 mem.put(fixture::TILE1, &[91]);
             }
             let reader = Reader {
+                resolved_root_rva: None,
+                source_hash: None,
                 memory: &mem,
                 base: fixture::BASE,
                 profile,

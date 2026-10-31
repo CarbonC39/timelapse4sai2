@@ -26,7 +26,7 @@ fn run() -> Result<(), String> {
             d.checkpoint_changed_ratio
         );
         println!(
-            "Target: known SAI2 x64 Preview and Major Renovated builds. Ctrl-C drains recording storage."
+            "Target: SAI2 x64 Preview and Major Renovated builds. Unknown Renovated builds require an open canvas for layout validation. Ctrl-C drains recording storage."
         );
         return Ok(());
     }
@@ -81,7 +81,44 @@ fn run() -> Result<(), String> {
     }
     let process = process::discover(pid)?;
     let hash = process::executable_hash(&process)?;
-    let profile = sai::profile::identify(&hash)?;
+    use sai::profile::{CompatibilityStatus, RootLocator};
+    let unsupported = |reason: String| format!("{:?}: {reason}", CompatibilityStatus::Unsupported);
+    let (profile, status, resolved_root_rva) = match sai::profile::identify(&hash) {
+        Ok(profile) => (profile, CompatibilityStatus::ExactKnownBuild, None),
+        Err(_) => {
+            let profile = &sai::builds::renovated_2026_10_19::SIGNATURE_PROFILE;
+            let RootLocator::Signature(signature) = profile.locator else {
+                unreachable!();
+            };
+            let image = std::fs::read(process.executable_path()).map_err(|e| {
+                unsupported(format!("cannot read executable for signature scan: {e}"))
+            })?;
+            if format!("{:x}", md5::compute(&image)) != hash {
+                return Err(unsupported(
+                    "executable changed during signature scan".into(),
+                ));
+            }
+            let rva = signature
+                .resolve(&image)
+                .map_err(|e| unsupported(format!("Renovated signature scan failed: {e}")))?;
+            (profile, CompatibilityStatus::SignatureValidated, Some(rva))
+        }
+    };
+    let reader = sai::reader::Reader {
+        memory: &process,
+        base: process.base_address,
+        profile,
+        resolved_root_rva,
+        source_hash: Some(&hash),
+    };
+    let validated_canvases =
+        if status == CompatibilityStatus::SignatureValidated {
+            Some(reader.validate_runtime_layout().map_err(|e| {
+                unsupported(format!("Renovated runtime layout validation failed: {e}"))
+            })?)
+        } else {
+            None
+        };
     if args[0] == "detect" {
         println!("Found sai2.exe (PID: {})", process.pid);
         println!("Module base: {:#x}", process.base_address);
@@ -91,14 +128,16 @@ fn run() -> Result<(), String> {
             profile.generation.name()
         );
         println!("Executable MD5: {hash}");
+        println!("Compatibility: {status:?}");
+        if let Some(rva) = resolved_root_rva {
+            println!("Session RVA: {rva:#x}");
+        }
         return Ok(());
     }
-    let reader = sai::reader::Reader {
-        memory: &process,
-        base: process.base_address,
-        profile,
+    let canvases = match validated_canvases {
+        Some(canvases) => canvases,
+        None => reader.canvases()?,
     };
-    let canvases = reader.canvases()?;
     if args[0] == "canvases" {
         for (i, c) in canvases.iter().enumerate() {
             println!(

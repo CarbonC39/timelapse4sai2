@@ -211,7 +211,10 @@ fn recording_manifest<M: ProcessMemory>(reader: &Reader<M>, canvas: &Canvas) -> 
         format_version: 1,
         sai_profile: reader.profile.display_name.into(),
         sai_generation: Some(reader.profile.generation.name().into()),
-        source_executable_md5: reader.profile.executable_hash.into(),
+        source_executable_md5: reader
+            .source_hash
+            .unwrap_or(reader.profile.executable_hash)
+            .into(),
         initial_width: canvas.width,
         initial_height: canvas.height,
         canvas_name: canvas.name.clone(),
