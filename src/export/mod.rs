@@ -3,16 +3,14 @@ mod ffmpeg;
 mod frame_map;
 mod replay;
 
+pub use ffmpeg::{Encoder, Quality};
+pub use frame_map::Target;
+pub use replay::{CanvasMode, Size};
 use crate::recorder::storage::{Event, Session, Transform};
-use ffmpeg::{Encoder, Quality, VideoWriter};
-use frame_map::{Plan, Target};
-use replay::{CanvasMode, Replay, Size, Spatial};
-use std::{
-    collections::BTreeSet,
-    io::Write,
-    path::Path,
-    time::{Duration, Instant},
-};
+use frame_map::FrameSchedule;
+use ffmpeg::VideoWriter;
+use replay::{Replay, Spatial};
+use std::{collections::BTreeSet, path::Path};
 
 pub const HELP: &str = "timelapse4sai2 export SESSION_DIR OUTPUT.mp4 [OPTIONS]
   --fps 30                    Output FPS (1..240); does not change drawing speed
@@ -33,16 +31,43 @@ Output: H.264 MP4 / yuv420p; odd dimensions pad 1px on right/bottom.";
 
 #[derive(Debug)]
 pub struct Options {
-    fps: u32,
-    speed: f64,
-    encoder: Encoder,
-    quality: Quality,
-    size: Size,
-    canvas_mode: CanvasMode,
-    hold_end: f64,
-    preview_end: f64,
-    skip_provisional: bool,
-    overwrite: bool,
+    pub fps: u32,
+    pub speed: f64,
+    pub encoder: Encoder,
+    pub quality: Quality,
+    pub size: Size,
+    pub canvas_mode: CanvasMode,
+    pub hold_end: f64,
+    pub preview_end: f64,
+    pub skip_provisional: bool,
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportPlan {
+    pub source_captures: u64,
+    pub selected_captures: u64,
+    pub output_video_frames: u64,
+    pub duration_ms: u64,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub fps: u32,
+    pub speed: f64,
+    pub preview_end_ms: u64,
+    pub hold_end_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportReport {
+    pub plan: ExportPlan,
+    pub warnings: Vec<String>,
+}
+
+struct Prepared {
+    plan: ExportPlan,
+    scan: Scan,
+    schedule: FrameSchedule,
+    spatial: Spatial,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -114,13 +139,14 @@ impl Options {
             }
             i += 2;
         }
-        Plan::new(vec![0], o.fps, o.speed, o.hold_end, o.preview_end)?;
+        FrameSchedule::new(vec![0], o.fps, o.speed, o.hold_end, o.preview_end)?;
         Ok(o)
     }
 }
 
 struct Scan {
     states: Vec<usize>,
+    source_captures: usize,
     max_width: u32,
     max_height: u32,
     // Last checkpoint's record offset, event index, and canvas dimensions.
@@ -146,6 +172,7 @@ fn scan(session: &mut Session, skip_provisional: bool) -> Result<Scan, String> {
     dimensions(w, h)?;
     let mut result = Scan {
         states: vec![],
+        source_captures: 0,
         max_width: w,
         max_height: h,
         checkpoint: None,
@@ -232,10 +259,11 @@ fn scan(session: &mut Session, skip_provisional: bool) -> Result<Scan, String> {
         if !transformed && grid.len() != w.div_ceil(256) as usize * h.div_ceil(256) as usize {
             return Err("session visual state has an incomplete tile grid".into());
         }
-        if frame_map::batch_kind(&events)
-            .is_some_and(|kind| frame_map::include(kind, skip_provisional))
-        {
-            result.states.push(result.batches);
+        if let Some(kind) = frame_map::batch_kind(&events) {
+            result.source_captures += 1;
+            if frame_map::include(kind, skip_provisional) {
+                result.states.push(result.batches);
+            }
         }
         result.batches += 1;
     }
@@ -244,6 +272,53 @@ fn scan(session: &mut Session, skip_provisional: bool) -> Result<Scan, String> {
     }
     Ok(result)
 }
+
+fn frames_to_ms(frames: u64, fps: u32) -> u64 {
+    ((u128::from(frames) * 1000 + u128::from(fps) / 2) / u128::from(fps)) as u64
+}
+
+fn prepare(session: &mut Session, options: &Options) -> Result<Prepared, String> {
+    let scan = scan(session, options.skip_provisional)?;
+    if scan.states.is_empty() {
+        return Err("session has no visual states after filtering; try including provisional states".into());
+    }
+    let schedule = FrameSchedule::new(
+        scan.states.clone(), options.fps, options.speed, options.hold_end, options.preview_end,
+    )?;
+    let (logical_width, logical_height) = match options.canvas_mode {
+        CanvasMode::Max => (scan.max_width, scan.max_height),
+        CanvasMode::Initial => (
+            session.manifest.initial_width,
+            session.manifest.initial_height,
+        ),
+    };
+    // Auto's limit is its conservative NVENC-compatible cap; no ffmpeg probe
+    // or rendering is needed to calculate planned dimensions.
+    let spatial = Spatial::new(
+        logical_width,
+        logical_height,
+        options.size,
+        ffmpeg::max_dimension(options.encoder),
+    )?;
+    let plan = ExportPlan {
+        source_captures: scan.source_captures as u64,
+        selected_captures: scan.states.len() as u64,
+        output_video_frames: schedule.len(),
+        duration_ms: frames_to_ms(schedule.len(), options.fps),
+        output_width: spatial.width,
+        output_height: spatial.height,
+        fps: options.fps,
+        speed: options.speed,
+        preview_end_ms: frames_to_ms(schedule.preview_frames(), options.fps),
+        hold_end_ms: frames_to_ms(schedule.hold_frames(), options.fps),
+    };
+    Ok(Prepared { plan, scan, schedule, spatial })
+}
+
+pub fn plan(session: &mut Session, options: &Options) -> Result<ExportPlan, String> {
+    Ok(prepare(session, options)?.plan)
+}
+
 fn apply_batch(replay: &mut Replay, events: &[Event], session: &mut Session) -> Result<(), String> {
     for event in events {
         replay.apply(event, &mut |id| session.load_blob(id))?;
@@ -275,16 +350,10 @@ pub fn dump_final(dir: &Path, output: &Path) -> Result<(), String> {
     let scan = scan(&mut session, false)?;
     let replay = final_replay(&mut session, &scan)?;
     crate::image::write_png(output, replay.width, replay.height, &replay.rgb)?;
-    println!(
-        "Wrote final {}x{} canvas to {}",
-        replay.width,
-        replay.height,
-        output.display()
-    );
     Ok(())
 }
 
-pub fn run(dir: &Path, output: &Path, options: Options) -> Result<(), String> {
+pub fn run(dir: &Path, output: &Path, options: Options) -> Result<ExportReport, String> {
     if !output
         .extension()
         .is_some_and(|s| s.eq_ignore_ascii_case("mp4"))
@@ -297,38 +366,11 @@ pub fn run(dir: &Path, output: &Path, options: Options) -> Result<(), String> {
             output.display()
         ));
     }
-    eprintln!("Reading and validating session...");
     let mut session = Session::open(dir)?;
-    let scanned = scan(&mut session, options.skip_provisional)?;
-    if scanned.states.is_empty() {
-        return Err(
-            "session has no visual states after filtering; try including provisional states".into(),
-        );
-    }
-    let plan = Plan::new(
-        scanned.states.clone(),
-        options.fps,
-        options.speed,
-        options.hold_end,
-        options.preview_end,
-    )?;
+    let prepared = prepare(&mut session, &options)?;
+    let warnings = session.warnings.clone();
     let encoder = ffmpeg::select_encoder(options.encoder)?;
-    let (w, h) = match options.canvas_mode {
-        CanvasMode::Max => (scanned.max_width, scanned.max_height),
-        CanvasMode::Initial => (
-            session.manifest.initial_width,
-            session.manifest.initial_height,
-        ),
-    };
-    let spatial = Spatial::new(w, h, options.size, ffmpeg::max_dimension(encoder))?;
-    eprintln!(
-        "Replaying session: {} states; encoding {}x{} at {} fps with {}...",
-        scanned.states.len(),
-        spatial.width,
-        spatial.height,
-        options.fps,
-        encoder.name()
-    );
+    let Prepared { plan, scan: scanned, schedule, spatial } = prepared;
     let mut final_frame = None;
     if options.preview_end > 0.0 {
         let final_state = final_replay(&mut session, &scanned)?;
@@ -352,8 +394,7 @@ pub fn run(dir: &Path, output: &Path, options: Options) -> Result<(), String> {
     let mut next_batch = 0usize;
     let mut cached = None;
     let mut previous = None;
-    let mut updated = Instant::now();
-    for (frame, target) in plan.frames().enumerate() {
+    for target in schedule.frames() {
         if target != Target::Final && Some(target) != previous {
             let Target::State(batch) = target else {
                 unreachable!()
@@ -380,16 +421,9 @@ pub fn run(dir: &Path, output: &Path, options: Options) -> Result<(), String> {
         };
         writer.write_frame(pixels.ok_or("missing rendered frame")?)?;
         previous = Some(target);
-        if updated.elapsed() >= Duration::from_millis(250) || frame as u64 + 1 == plan.len() {
-            eprint!("\rFrames: {} / {}", frame + 1, plan.len());
-            let _ = std::io::stderr().flush();
-            updated = Instant::now();
-        }
     }
-    eprintln!();
     writer.finish()?;
-    println!("Exported {} frames to {}", plan.len(), output.display());
-    Ok(())
+    Ok(ExportReport { plan, warnings })
 }
 
 #[cfg(test)]

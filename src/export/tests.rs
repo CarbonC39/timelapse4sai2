@@ -178,3 +178,30 @@ fn session_lock_blocks_writer_and_readonly_open_preserves_incomplete_tail() {
     drop(session);
     assert_eq!(fs::metadata(&timeline).unwrap().len(), size_before);
 }
+
+#[test]
+fn public_plan_reports_filtered_captures_exact_timing_and_dimensions() {
+    let fixture = Fixture::new();
+    fixture.session();
+    let mut session = Session::open(fixture.path()).unwrap();
+    let options = Options {
+        skip_provisional: true,
+        encoder: super::Encoder::X264,
+        hold_end: 0.05,
+        preview_end: 0.05,
+        ..Options::default()
+    };
+    let prepared = super::prepare(&mut session, &options).unwrap();
+    assert_eq!(
+        prepared.schedule.frames().count() as u64,
+        prepared.plan.output_video_frames
+    );
+    let plan = prepared.plan;
+    assert_eq!(plan.source_captures, 5);
+    assert_eq!(plan.selected_captures, 3);
+    assert_eq!(plan.output_video_frames, 7); // 3 visuals + 2 preview + 2 hold
+    assert_eq!(plan.duration_ms, 233);
+    assert_eq!((plan.output_width, plan.output_height), (512, 2));
+    assert_eq!((plan.fps, plan.speed), (30, 1.0));
+    assert_eq!((plan.preview_end_ms, plan.hold_end_ms), (67, 67));
+}

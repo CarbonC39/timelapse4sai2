@@ -113,13 +113,7 @@ where
         Encoder::X264 => probe("libx264").map(|_| Encoder::X264),
         Encoder::Auto => match probe("h264_nvenc") {
             Ok(()) => Ok(Encoder::Nvenc),
-            Err(nvenc) => {
-                eprintln!(
-                    "ffmpeg: NVENC unavailable ({}); falling back to libx264",
-                    nvenc.lines().next().unwrap_or(&nvenc)
-                );
-                probe("libx264").map(|_| Encoder::X264)
-            }
+            Err(_) => probe("libx264").map(|_| Encoder::X264),
         },
     }
 }

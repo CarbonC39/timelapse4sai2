@@ -1,8 +1,4 @@
-mod export;
-mod image;
-mod process;
-mod recorder;
-mod sai;
+use timelapse4sai2::{export, image, process, recorder, sai};
 use std::path::Path;
 
 fn run() -> Result<(), String> {
@@ -12,6 +8,7 @@ fn run() -> Result<(), String> {
             "timelapse4sai2 [--pid PID] detect|canvases|dump INDEX FILE [--channel-order bgra|rgba]"
         );
         println!("timelapse4sai2 [--pid PID] record INDEX SESSION_DIR [OPTIONS]");
+        println!("timelapse4sai2 info SESSION_DIR");
         println!("timelapse4sai2 verify SESSION_DIR");
         println!("timelapse4sai2 verify SESSION_DIR --dump-final FILE.png");
         println!("{}", export::HELP);
@@ -30,12 +27,30 @@ fn run() -> Result<(), String> {
         );
         return Ok(());
     }
+    if args.first().map(String::as_str) == Some("info") {
+        if args.len() != 2 { return Err("usage: timelapse4sai2 info SESSION_DIR".into()); }
+        let session = recorder::storage::Session::open(Path::new(&args[1]))?;
+        let summary = session.summary()?;
+        for warning in &session.warnings { eprintln!("Warning: {warning}"); }
+        let seconds = summary.tracked_duration_ms / 1000;
+        println!("Canvas: {}", summary.canvas_name);
+        println!("Tracked: {}h {}m {}s", seconds / 3600, seconds / 60 % 60, seconds % 60);
+        println!("Captures: {}\n  Stable: {}\n  Provisional: {}", summary.captures, summary.stable_captures, summary.provisional_captures);
+        println!("Size: {:.2} GiB", summary.disk_bytes as f64 / 1073741824.0);
+        println!("Dimensions: {}x{}", summary.current_width, summary.current_height);
+        return Ok(());
+    }
     if args.first().map(String::as_str) == Some("verify") {
         if args.len() == 2 {
-            return recorder::storage::verify(Path::new(&args[1]));
+            let report = recorder::storage::verify(Path::new(&args[1]))?;
+            for warning in &report.warnings { eprintln!("Warning: {warning}"); }
+            let summary = report.summary;
+            println!("Verified: {} captures ({} stable, {} provisional), {} unique blobs", summary.captures, summary.stable_captures, summary.provisional_captures, summary.unique_blobs);
+            return Ok(());
         }
         if args.len() == 4 && args[2] == "--dump-final" {
-            recorder::storage::verify(Path::new(&args[1]))?;
+            let report = recorder::storage::verify(Path::new(&args[1]))?;
+            for warning in &report.warnings { eprintln!("Warning: {warning}"); }
             return export::dump_final(Path::new(&args[1]), Path::new(&args[3]));
         }
         return Err("usage: timelapse4sai2 verify SESSION_DIR [--dump-final FILE.png]".into());
@@ -45,7 +60,10 @@ fn run() -> Result<(), String> {
             return Err(export::HELP.into());
         }
         let options = export::Options::parse(&args[3..])?;
-        return export::run(Path::new(&args[1]), Path::new(&args[2]), options);
+        let report = export::run(Path::new(&args[1]), Path::new(&args[2]), options)?;
+        for warning in &report.warnings { eprintln!("Warning: {warning}"); }
+        println!("Exported {} video frames to {}", report.plan.output_video_frames, args[2]);
+        return Ok(());
     }
     let mut pid = None;
     if args.first().is_some_and(|a| a == "--pid") {
@@ -152,12 +170,16 @@ fn run() -> Result<(), String> {
             .get(index)
             .ok_or("canvas index out of range; run canvases again")?;
         if args[0] == "record" {
-            return recorder::record(
+            eprintln!("Recording {} to {}; Ctrl-C stops and drains storage.", c.name, args[2]);
+            let metrics = recorder::record(
                 &reader,
                 c,
                 Path::new(&args[2]),
                 recorder::Config::parse(&args[3..])?,
-            );
+            )?;
+            for warning in &metrics.warnings { eprintln!("Warning: {warning}"); }
+            eprintln!("Captures: {} ({} provisional)", metrics.logical_frames, metrics.provisional_frames);
+            return Ok(());
         }
         let rgb = reader.composite(c, rgba)?;
         image::write_png(Path::new(&args[2]), c.width, c.height, &rgb)?;

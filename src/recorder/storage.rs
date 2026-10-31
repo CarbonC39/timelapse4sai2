@@ -130,7 +130,87 @@ fn verify_identity(id: BlobId, raw: &[u8]) -> Result<(), String> {
         Ok(())
     }
 }
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionStats {
+    pub tracked_duration_ms: u64,
+    pub recording_runs: u64,
+    pub captures: u64,
+    pub stable_captures: u64,
+    pub provisional_captures: u64,
+    pub last_updated_unix_ms: u64,
+}
+impl SessionStats {
+    fn capture(&mut self, kind: FrameKind) {
+        self.captures += 1;
+        match kind {
+            FrameKind::Stable => self.stable_captures += 1,
+            FrameKind::Provisional => self.provisional_captures += 1,
+        }
+    }
+    fn clear_captures(&mut self) {
+        self.captures = 0;
+        self.stable_captures = 0;
+        self.provisional_captures = 0;
+    }
+    pub fn save(&self, dir: &Path) -> Result<(), String> {
+        let mut file = File::create(dir.join("stats.tmp")).map_err(err)?;
+        file.write_all(&serde_json::to_vec_pretty(self).map_err(err)?).map_err(err)?;
+        file.sync_all().map_err(err)?;
+        fs::rename(dir.join("stats.tmp"), dir.join("stats.json")).map_err(err)?;
+        crate::process::sync_directory(dir).map_err(err)
+    }
+}
+fn read_stats(dir: &Path) -> (SessionStats, Vec<String>) {
+    match fs::read(dir.join("stats.json")) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(stats) => (stats, vec![]),
+            Err(e) => (SessionStats::default(), vec![format!("Invalid stats.json; tracked duration and recording runs reset to zero: {e}")]),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (SessionStats::default(), vec![]),
+        Err(e) => (SessionStats::default(), vec![format!("Cannot read stats.json; tracked duration and recording runs reset to zero: {e}")]),
+    }
+}
+#[derive(Debug, Clone)]
+pub struct RecordingStats {
+    pub current_run_elapsed_ms: u64,
+    pub total_tracked_duration_ms: u64,
+    pub captures: u64,
+    pub stable_captures: u64,
+    pub provisional_captures: u64,
+}
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub tracked_duration_ms: u64,
+    pub captures: u64,
+    pub stable_captures: u64,
+    pub provisional_captures: u64,
+    pub unique_blobs: u64,
+    pub disk_bytes: u64,
+    pub initial_width: u32,
+    pub initial_height: u32,
+    pub current_width: u32,
+    pub current_height: u32,
+    pub canvas_name: String,
+}
+pub fn disk_bytes(dir: &Path) -> Result<u64, String> {
+    let mut bytes = 0;
+    for name in ["manifest.json", "blobs.bin", "timeline.bin", "session.lock", "stats.json", "stats.tmp", "manifest.tmp"] {
+        match fs::metadata(dir.join(name)) {
+            Ok(metadata) if metadata.is_file() => bytes += metadata.len(),
+            Ok(_) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(err(e)),
+        }
+    }
+    Ok(bytes)
+}
+
 pub struct Store {
+    dir: std::path::PathBuf,
+    pub stats: SessionStats,
+    pub warnings: Vec<String>,
+    run_started: Option<Instant>,
+    last_stats_flush: Option<Instant>,
     _lock: File,
     blobs: File,
     timeline: File,
@@ -172,7 +252,10 @@ impl Store {
             fs::rename(dir.join("manifest.tmp"), &path).map_err(err)?;
             crate::process::sync_directory(dir).map_err(err)?;
         }
+        let (mut stats, warnings) = read_stats(dir);
+        stats.clear_captures();
         let mut s = Self {
+            dir: dir.to_owned(), stats, warnings, run_started: None, last_stats_flush: None,
             _lock: lock,
             blobs: open(&dir.join("blobs.bin"))?,
             timeline: open(&dir.join("timeline.bin"))?,
@@ -208,9 +291,50 @@ impl Store {
         }
         s.timeline.set_len(end).map_err(err)?;
         s.timeline.seek(SeekFrom::End(0)).map_err(err)?;
+        if let Err(e) = s.stats.save(dir) {
+            s.warnings.push(format!("Could not repair stats.json cache: {e}"));
+        }
         Ok(s)
     }
+    pub fn start_recording(&mut self) -> Result<(), String> {
+        if self.run_started.is_none() {
+            self.run_started = Some(Instant::now());
+            self.stats.recording_runs = self.stats.recording_runs.saturating_add(1);
+            self.flush_stats()?;
+        }
+        Ok(())
+    }
+    pub fn recording_stats(&self) -> RecordingStats {
+        let elapsed = self.run_started.map(|start| start.elapsed().as_millis().min(u64::MAX as u128) as u64).unwrap_or(0);
+        RecordingStats {
+            current_run_elapsed_ms: elapsed,
+            total_tracked_duration_ms: self.stats.tracked_duration_ms.saturating_add(elapsed),
+            captures: self.stats.captures,
+            stable_captures: self.stats.stable_captures,
+            provisional_captures: self.stats.provisional_captures,
+        }
+    }
+    pub fn flush_stats(&mut self) -> Result<(), String> {
+        let mut snapshot = self.stats.clone();
+        snapshot.tracked_duration_ms = self.recording_stats().total_tracked_duration_ms;
+        snapshot.last_updated_unix_ms = timestamp();
+        // Ensure persisted captures never precede their referenced data after a crash.
+        self.blobs.sync_all().map_err(err)?;
+        self.timeline.sync_all().map_err(err)?;
+        snapshot.save(&self.dir)?;
+        self.last_stats_flush = Some(Instant::now());
+        Ok(())
+    }
+    pub fn persist_stats_if_due(&mut self) -> Result<(), String> {
+        if self.run_started.is_some() && self.last_stats_flush.is_none_or(|last| last.elapsed().as_secs() >= 30) {
+            self.flush_stats()?;
+        }
+        Ok(())
+    }
     fn apply(&mut self, event: &Event) -> Result<(), String> {
+        if let Event::Frame {kind, ..} | Event::CanvasResize {kind, ..} = event {
+            self.stats.capture(*kind);
+        }
         let tiles = match event {
             Event::Frame { changed_tiles, .. } => {
                 self.since_checkpoint += 1;
@@ -331,6 +455,7 @@ impl Store {
         append(&mut self.timeline, &events)?;
         self.timeline.flush().map_err(err)?;
         self.state = state;
+        self.stats.capture(kind);
         self.metrics.logical_frames += 1;
         if kind == FrameKind::Provisional {
             self.metrics.provisional_frames += 1;
@@ -344,109 +469,27 @@ impl Store {
     }
 }
 
-/// Validate and summarize a stopped session without
-/// attaching to the SAI process. Opening the store performs blob checks,
-/// truncates incomplete tails, and replays the timeline to validate references.
-pub fn verify(dir: &Path) -> Result<(), String> {
-    let manifest_path = dir.join("manifest.json");
-    let manifest: Manifest =
-        serde_json::from_slice(&fs::read(&manifest_path).map_err(err)?).map_err(err)?;
+/// Validate all stored blob identities and timeline references.
+pub struct VerificationReport {
+    pub summary: SessionSummary,
+    pub warnings: Vec<String>,
+}
+pub fn verify(dir: &Path) -> Result<VerificationReport, String> {
+    let manifest: Manifest = serde_json::from_slice(&fs::read(dir.join("manifest.json")).map_err(err)?).map_err(err)?;
     let store = Store::open(dir, manifest, Config::default())?;
-    let blob_count = store.index.len();
-    let blob_bytes = fs::metadata(dir.join("blobs.bin")).map_err(err)?.len();
-    let mut timeline = File::open(dir.join("timeline.bin")).map_err(err)?;
-    let mut frame_count = 0u64;
-    let mut stable_count = 0u64;
-    let mut provisional_count = 0u64;
-    let mut resize_count = 0u64;
-    let mut checkpoint_count = 0u64;
-    let mut delta_tiles = 0u64;
-    let mut blob_references = 0u64;
-    let mut referenced_ids = std::collections::HashSet::new();
-    while let Some(data) = next(&mut timeline)? {
-        let events: Vec<Event> = bincode::deserialize(&data).map_err(err)?;
-        for event in events {
-            match event {
-                Event::Frame {
-                    kind,
-                    timestamp_ms,
-                    changed_tiles,
-                } => {
-                    frame_count += 1;
-                    match kind {
-                        FrameKind::Stable => stable_count += 1,
-                        FrameKind::Provisional => provisional_count += 1,
-                    }
-                    delta_tiles += changed_tiles.len() as u64;
-                    blob_references += changed_tiles.len() as u64;
-                    referenced_ids.extend(changed_tiles.iter().map(|(_, id)| *id));
-                    println!(
-                        "frame {frame_count}: {kind:?} at {timestamp_ms} ms, {} changed tiles",
-                        changed_tiles.len()
-                    );
-                }
-                Event::CanvasResize {
-                    kind,
-                    timestamp_ms,
-                    old_width,
-                    old_height,
-                    new_width,
-                    new_height,
-                    ..
-                } => {
-                    resize_count += 1;
-                    println!(
-                        "resize {resize_count}: {kind:?} at {timestamp_ms} ms, {old_width}x{old_height} -> {new_width}x{new_height}"
-                    );
-                }
-                Event::Checkpoint {
-                    width,
-                    height,
-                    nx,
-                    ny,
-                    tiles,
-                } => {
-                    checkpoint_count += 1;
-                    blob_references += tiles.len() as u64;
-                    referenced_ids.extend(tiles.iter().map(|(_, id)| *id));
-                    println!(
-                        "checkpoint {checkpoint_count}: {width}x{height}, grid {nx}x{ny}, {} tiles",
-                        tiles.len()
-                    );
-                }
-                Event::Transform {
-                    timestamp_ms,
-                    transform,
-                } => {
-                    println!("transform: {transform:?} at {timestamp_ms} ms");
-                }
-            }
-        }
-    }
-    let nx = store.state.width.div_ceil(256);
-    let ny = store.state.height.div_ceil(256);
-    println!(
-        "verified: {frame_count} frames ({stable_count} stable, {provisional_count} provisional), {resize_count} resizes, {checkpoint_count} checkpoints"
-    );
-    println!(
-        "blobs: {blob_count} unique stored, {} referenced ids, {} references, {} repeated references; {blob_bytes} file bytes",
-        referenced_ids.len(),
-        blob_references,
-        blob_references.saturating_sub(referenced_ids.len() as u64)
-    );
-    println!(
-        "final canvas: {}x{}, grid {}x{}, {} tiles; {delta_tiles} timeline delta tile entries",
-        store.state.width,
-        store.state.height,
-        nx,
-        ny,
-        store.state.tiles.len()
-    );
-    Ok(())
+    let warnings = store.warnings.clone();
+    drop(store);
+    Ok(VerificationReport { summary: Session::open(dir)?.summary()?, warnings })
 }
 
 /// Read-only access to a stopped session. Incomplete tails are ignored, never truncated.
+pub type SessionReader = Session;
 pub struct Session {
+    dir: std::path::PathBuf,
+    pub stats: SessionStats,
+    pub warnings: Vec<String>,
+    current_width: u32,
+    current_height: u32,
     _lock: File,
     pub manifest: Manifest,
     blobs: File,
@@ -474,16 +517,49 @@ impl Session {
             let offset = blobs.stream_position().map_err(err)?;
             let Some(data) = next(&mut blobs)? else { break };
             let blob: Blob = bincode::deserialize(&data).map_err(err)?;
-            let raw = zstd::bulk::decompress(&blob.compressed, TILE_BYTES).map_err(err)?;
-            verify_identity(blob.id, &raw)?;
             index.insert(blob.id, offset);
         }
+        let (mut stats, warnings) = read_stats(dir);
+        stats.clear_captures();
+        let mut timeline = File::open(dir.join("timeline.bin")).map_err(err)?;
+        let (mut current_width, mut current_height) = (manifest.initial_width, manifest.initial_height);
+        while let Some(data) = next(&mut timeline)? {
+            let events: Vec<Event> = bincode::deserialize(&data).map_err(err)?;
+            for event in events {
+                match event {
+                    Event::Frame {kind, ..} => stats.capture(kind),
+                    Event::CanvasResize {kind, new_width, new_height, ..} => {
+                        stats.capture(kind); current_width = new_width; current_height = new_height;
+                    }
+                    Event::Checkpoint {width, height, ..} => {current_width = width; current_height = height;}
+                    Event::Transform {transform: Transform::Rotate90CW | Transform::Rotate90CCW, ..} => {std::mem::swap(&mut current_width, &mut current_height);}
+                    _ => (),
+                }
+            }
+        }
+        timeline.seek(SeekFrom::Start(0)).map_err(err)?;
         Ok(Self {
+            dir: dir.to_owned(), stats, warnings, current_width, current_height,
             _lock: lock,
             manifest,
             blobs,
-            timeline: File::open(dir.join("timeline.bin")).map_err(err)?,
+            timeline,
             index,
+        })
+    }
+    pub fn summary(&self) -> Result<SessionSummary, String> {
+        Ok(SessionSummary {
+            tracked_duration_ms: self.stats.tracked_duration_ms,
+            captures: self.stats.captures,
+            stable_captures: self.stats.stable_captures,
+            provisional_captures: self.stats.provisional_captures,
+            unique_blobs: self.index.len() as u64,
+            disk_bytes: disk_bytes(&self.dir)?,
+            initial_width: self.manifest.initial_width,
+            initial_height: self.manifest.initial_height,
+            current_width: self.current_width,
+            current_height: self.current_height,
+            canvas_name: self.manifest.canvas_name.clone(),
         })
     }
     pub fn position(&mut self) -> Result<u64, String> {
@@ -526,5 +602,102 @@ impl Session {
         let raw = zstd::bulk::decompress(&blob.compressed, TILE_BYTES).map_err(err)?;
         verify_identity(id, &raw)?;
         Ok(raw)
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+    fn fixture() -> (std::path::PathBuf, Manifest) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("sai-stats-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let manifest = Manifest {
+            format_version: 1, sai_profile: "test".into(), sai_generation: None,
+            source_executable_md5: "test".into(), initial_width: 1, initial_height: 1,
+            canvas_name: "canvas".into(), canvas_path: "canvas".into(), tile_size: 256,
+            channel_order: "BGRX".into(), creation_time_unix_ms: 0,
+            recorder_version: "test".into(), identity_limit: "test".into(),
+        };
+        (dir, manifest)
+    }
+    #[test]
+    fn monotonic_runs_and_atomic_cache() {
+        let (dir, manifest) = fixture();
+        let mut store = Store::open(&dir, manifest, Config::default()).unwrap();
+        assert_eq!(store.recording_stats().total_tracked_duration_ms, 0);
+        assert_eq!(store.stats.recording_runs, 0);
+        store.start_recording().unwrap();
+        store.run_started = Some(Instant::now() - std::time::Duration::from_millis(1234));
+        store.flush_stats().unwrap();
+        let (first, warnings) = read_stats(&dir);
+        assert!(warnings.is_empty());
+        assert!(first.tracked_duration_ms >= 1234);
+        assert_eq!(first.recording_runs, 1);
+        assert!(!dir.join("stats.tmp").exists());
+        drop(store);
+        let manifest = serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let mut store = Store::open(&dir, manifest, Config::default()).unwrap();
+        store.start_recording().unwrap();
+        store.run_started = Some(Instant::now() - std::time::Duration::from_millis(567));
+        store.flush_stats().unwrap();
+        let (second, _) = read_stats(&dir);
+        assert!(second.tracked_duration_ms >= first.tracked_duration_ms + 567);
+        assert_eq!(second.recording_runs, 2);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn heartbeat_is_low_frequency_and_never_changes_timeline() {
+        let (dir, manifest) = fixture();
+        let mut store = Store::open(&dir, manifest, Config::default()).unwrap();
+        store.start_recording().unwrap();
+        let before = fs::read(dir.join("stats.json")).unwrap();
+        store.run_started = Some(Instant::now() - std::time::Duration::from_secs(31));
+        store.persist_stats_if_due().unwrap();
+        assert_eq!(fs::read(dir.join("stats.json")).unwrap(), before);
+        store.last_stats_flush = Some(Instant::now() - std::time::Duration::from_secs(31));
+        store.persist_stats_if_due().unwrap();
+        assert!(read_stats(&dir).0.tracked_duration_ms >= 31_000);
+        store.flush_stats().unwrap();
+        assert!(read_stats(&dir).0.tracked_duration_ms < 32_000);
+        assert_eq!(fs::metadata(dir.join("timeline.bin")).unwrap().len(), 0);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn legacy_corrupt_and_stale_cache_are_recovered_from_timeline() {
+        let (dir, manifest) = fixture();
+        let mut store = Store::open(&dir, manifest, Config::default()).unwrap();
+        let raw = vec![0; TILE_BYTES];
+        let id = xxh3_128(&raw);
+        for (kind, width) in [(FrameKind::Stable, 1), (FrameKind::Provisional, 2)] {
+            store.begin(kind, 0, width, 1);
+            store.tile((0, 0), id, &raw).unwrap();
+            store.end().unwrap();
+        }
+        drop(store);
+        let stale = SessionReader::open(&dir).unwrap();
+        assert_eq!(stale.stats.captures, 2);
+        assert_eq!(read_stats(&dir).0.captures, 0);
+        drop(stale);
+        fs::remove_file(dir.join("stats.json")).unwrap();
+        let reader = SessionReader::open(&dir).unwrap();
+        let summary = reader.summary().unwrap();
+        assert_eq!((summary.captures, summary.stable_captures, summary.provisional_captures), (2, 1, 1));
+        assert_eq!(summary.tracked_duration_ms, 0);
+        assert_eq!((summary.current_width, summary.current_height, summary.unique_blobs), (2, 1, 1));
+        assert_eq!(summary.disk_bytes, fs::read_dir(&dir).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum::<u64>());
+        drop(reader);
+        fs::write(dir.join("stats.json"), b"broken").unwrap();
+        let reader = SessionReader::open(&dir).unwrap();
+        assert_eq!(reader.warnings.len(), 1);
+        assert_eq!(reader.stats.captures, 2);
+        drop(reader);
+        let manifest = serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let store = Store::open(&dir, manifest, Config::default()).unwrap();
+        assert_eq!(store.warnings.len(), 1);
+        assert_eq!(read_stats(&dir).0.captures, 2);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

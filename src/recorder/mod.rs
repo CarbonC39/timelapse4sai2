@@ -92,6 +92,7 @@ impl Config {
 }
 #[derive(Default, Debug)]
 pub struct Metrics {
+    pub warnings: Vec<String>,
     pub capture_candidates: u64,
     pub logical_frames: u64,
     pub provisional_frames: u64,
@@ -236,21 +237,42 @@ pub fn record<M: ProcessMemory>(
     canvas: &Canvas,
     dir: &Path,
     config: Config,
-) -> Result<(), String> {
+) -> Result<Metrics, String> {
+    record_with_status(reader, canvas, dir, config, |_| {})
+}
+
+/// The observer receives a snapshot at most four times per second on the storage thread.
+pub fn record_with_status<M: ProcessMemory>(
+    reader: &Reader<M>, canvas: &Canvas, dir: &Path, config: Config,
+    mut observer: impl FnMut(storage::RecordingStats) + Send + 'static,
+) -> Result<Metrics, String> {
     let mut input = if config.no_input_watch {
         None
     } else {
         Some(crate::process::InputWatcher::new()?)
     };
     let manifest = recording_manifest(reader, canvas);
-    let store = Store::open(dir, manifest, config.clone())?;
+    let mut store = Store::open(dir, manifest, config.clone())?;
     STOP.store(false, Ordering::Relaxed);
     crate::process::install_stop_handler(&STOP)?;
     let (tx, rx) = sync_channel(2);
     let (recycle_tx, recycle_rx) = sync_channel(4);
+    store.start_recording()?;
     let worker = std::thread::spawn(move || -> Result<Metrics, String> {
         let mut store = store;
-        for message in rx {
+        let mut last_update = Instant::now();
+        observer(store.recording_stats());
+        loop {
+            let message = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                Ok(message) => message,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    store.persist_stats_if_due()?;
+                    observer(store.recording_stats());
+                    last_update = Instant::now();
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             match message {
                 Message::Begin(k, t, w, h) => store.begin(k, t, w, h),
                 Message::Tile(c, h, raw) => {
@@ -260,7 +282,15 @@ pub fn record<M: ProcessMemory>(
                 Message::End => store.end()?,
                 Message::Abort => store.abort(),
             }
+            store.persist_stats_if_due()?;
+            if last_update.elapsed().as_millis() >= 250 {
+                observer(store.recording_stats());
+                last_update = Instant::now();
+            }
         }
+        store.flush_stats()?;
+        observer(store.recording_stats());
+        store.metrics.warnings = store.warnings.clone();
         Ok(store.metrics)
     });
     let start = Instant::now();
@@ -275,11 +305,6 @@ pub fn record<M: ProcessMemory>(
         ..CaptureState::default()
     };
     let mut metrics = Metrics::default();
-    eprintln!(
-        "Recording {} to {}; Ctrl-C stops and drains storage.",
-        canvas.name,
-        dir.display()
-    );
     let result = (|| {
         capture.capture(reader, canvas, FrameKind::Stable, &tx, &mut metrics)?;
         scheduler.captured(start.elapsed().as_millis() as u64, FrameKind::Stable);
@@ -308,7 +333,6 @@ pub fn record<M: ProcessMemory>(
                         {
                             return Err(e);
                         }
-                        eprintln!("Candidate discarded: {e}");
                     }
                 }
             }
@@ -319,6 +343,7 @@ pub fn record<M: ProcessMemory>(
     })();
     drop(tx);
     let storage = worker.join().map_err(|_| "storage worker panicked")??;
+    metrics.warnings = storage.warnings;
     metrics.logical_frames = storage.logical_frames;
     metrics.provisional_frames = storage.provisional_frames;
     metrics.tiles_changed = storage.tiles_changed;
@@ -326,6 +351,6 @@ pub fn record<M: ProcessMemory>(
     metrics.deduplicated_blobs = storage.deduplicated_blobs;
     metrics.compressed_bytes_written = storage.compressed_bytes_written;
     metrics.checkpoint_count = storage.checkpoint_count;
-    eprintln!("{metrics:#?}");
-    result
+    result?;
+    Ok(metrics)
 }

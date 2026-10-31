@@ -12,14 +12,14 @@ pub enum Target {
 }
 
 #[derive(Debug, Clone)]
-pub struct Plan {
+pub struct FrameSchedule {
     states: Vec<usize>,
     frame_count: u64,
     preview_count: u64,
     hold_count: u64,
 }
 
-impl Plan {
+impl FrameSchedule {
     pub fn new(
         states: Vec<usize>,
         fps: u32,
@@ -42,9 +42,8 @@ impl Plan {
             return Err("at least one state is required".into());
         }
 
-        let n = states.len() as f64;
-        let raw_count = (n * f64::from(fps) / (LOGICAL_FPS * speed)).ceil().max(1.0);
-        let frame_count = checked_count(raw_count, "output frame count")?;
+        let seconds = states.len() as f64 / (LOGICAL_FPS * speed);
+        let frame_count = seconds_to_frames(seconds, fps, "output frame count")?.max(1);
         let hold_count = seconds_to_frames(hold_end, fps, "hold_end")?;
         let preview_count = seconds_to_frames(preview_end, fps, "preview_end")?;
         let final_count = hold_count
@@ -68,6 +67,13 @@ impl Plan {
         self.frame_count + self.preview_count + self.hold_count
     }
 
+    #[cfg(test)]
+    pub fn visual_frames(&self) -> u64 { self.frame_count }
+
+    pub fn preview_frames(&self) -> u64 { self.preview_count }
+
+    pub fn hold_frames(&self) -> u64 { self.hold_count }
+
     pub fn frames(&self) -> impl Iterator<Item = Target> + '_ {
         FrameIter {
             plan: self,
@@ -77,7 +83,7 @@ impl Plan {
 }
 
 struct FrameIter<'a> {
-    plan: &'a Plan,
+    plan: &'a FrameSchedule,
     position: u64,
 }
 
@@ -97,15 +103,17 @@ impl Iterator for FrameIter<'_> {
         if i >= self.plan.frame_count {
             return Some(Target::Final);
         }
-        let count = self.plan.frame_count;
         let n = self.plan.states.len() as u128;
+        let count = self.plan.frame_count;
         let slot = if count <= 1 {
             (n - 1) as usize
         } else if n <= 1 {
             0
         } else {
-            // Round the endpoint-preserving rational position to nearest integer.
-            ((u128::from(i) * (n - 1) + u128::from(count - 1) / 2) / u128::from(count - 1)) as usize
+            // Keep both endpoints while distributing intermediate samples
+            // evenly. Integer arithmetic makes the schedule deterministic.
+            ((u128::from(i) * (n - 1) + u128::from(count - 1) / 2)
+                / u128::from(count - 1)) as usize
         };
         Some(Target::State(self.plan.states[slot]))
     }
@@ -140,7 +148,7 @@ mod tests {
     use super::*;
 
     fn mapped(n: usize, fps: u32, speed: f64) -> Vec<Target> {
-        Plan::new((0..n).collect(), fps, speed, 0.0, 0.0)
+        FrameSchedule::new((0..n).collect(), fps, speed, 0.0, 0.0)
             .unwrap()
             .frames()
             .collect()
@@ -177,8 +185,24 @@ mod tests {
     }
 
     #[test]
+    fn fps_and_speed_set_output_density_and_duration() {
+        assert_eq!(
+            mapped(4, 60, 2.0),
+            vec![Target::State(0), Target::State(1), Target::State(2), Target::State(3)]
+        );
+        assert_eq!(
+            mapped(4, 30, 2.0),
+            vec![Target::State(0), Target::State(3)]
+        );
+        let thirty = FrameSchedule::new(vec![0, 1, 2, 3], 30, 1.0, 0.0, 0.0).unwrap();
+        let sixty = FrameSchedule::new(vec![0, 1, 2, 3], 60, 2.0, 0.0, 0.0).unwrap();
+        assert_eq!((thirty.visual_frames(), sixty.visual_frames()), (4, 4));
+        assert_eq!(thirty.len() as f64 / 30.0, 2.0 * sixty.len() as f64 / 60.0);
+    }
+
+    #[test]
     fn durations_and_final_holds_are_output_fps_based() {
-        let p = Plan::new(vec![8, 12], 30, 1.0, 0.1, 0.2).unwrap();
+        let p = FrameSchedule::new(vec![8, 12], 30, 1.0, 0.1, 0.2).unwrap();
         assert_eq!(p.len(), 11); // 6 preview + 2 mapped + 3 hold frames
         assert_eq!(
             p.frames().collect::<Vec<_>>(),
@@ -189,10 +213,19 @@ mod tests {
             ]
             .concat()
         );
-        let p = Plan::new(vec![8], 60, 1.0, 0.1, 0.2).unwrap();
+        let p = FrameSchedule::new(vec![8], 60, 1.0, 0.1, 0.2).unwrap();
         assert_eq!(p.len(), 20);
-        let p = Plan::new(vec![0, 1, 2], 1, 1.0, 0.0, 0.0).unwrap();
+        let p = FrameSchedule::new(vec![0, 1, 2], 1, 1.0, 0.0, 0.0).unwrap();
         assert_eq!(p.frames().collect::<Vec<_>>(), vec![Target::State(2)]);
+    }
+
+    #[test]
+    fn fractional_hold_and_preview_durations_round_to_nearest_output_frame() {
+        let p = FrameSchedule::new(vec![0], 30, 1.0, 0.05, 0.05).unwrap();
+        assert_eq!(p.preview_frames(), 2);
+        assert_eq!(p.hold_frames(), 2);
+        assert_eq!(p.visual_frames(), 1);
+        assert_eq!(p.len(), 5);
     }
 
     #[test]
@@ -205,10 +238,10 @@ mod tests {
             (30, 1.0, -1.0, 0.0),
             (30, 1.0, 0.0, f64::INFINITY),
         ] {
-            assert!(Plan::new(vec![0], fps, speed, hold, preview).is_err());
+            assert!(FrameSchedule::new(vec![0], fps, speed, hold, preview).is_err());
         }
-        assert!(Plan::new(vec![], 30, 1.0, 0.0, 0.0).is_err());
-        assert!(Plan::new(vec![0], 30, 1.0, f64::MAX, 0.0).is_err());
+        assert!(FrameSchedule::new(vec![], 30, 1.0, 0.0, 0.0).is_err());
+        assert!(FrameSchedule::new(vec![0], 30, 1.0, f64::MAX, 0.0).is_err());
     }
 
     #[test]
