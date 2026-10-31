@@ -14,7 +14,7 @@ fn run() -> Result<(), String> {
         println!("{}", export::HELP);
         let d = recorder::Config::default();
         println!(
-            "  --idle-delay-ms {}\n  --min-capture-gap-ms {}\n  --max-active-gap-ms {}\n  --zstd-level {}\n  --checkpoint-every-events {}\n  --checkpoint-changed-ratio {}\n  --no-input-watch",
+            "  --idle-delay-ms {}\n  --min-capture-gap-ms {}\n  --max-active-gap-ms {}\n  --zstd-level {}\n  --checkpoint-every-events {}\n  --checkpoint-changed-ratio {}\n  --no-input-watch\n  --allow-canvas-mismatch",
             d.idle_delay_ms,
             d.min_capture_gap_ms,
             d.max_active_gap_ms,

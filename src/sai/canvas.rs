@@ -7,3 +7,9 @@ pub struct Canvas {
     pub name: String,
     pub short_path: String,
 }
+
+impl Canvas {
+    pub fn same_live_identity(&self, other: &Canvas) -> bool {
+        self.address == other.address && self.id == other.id
+    }
+}

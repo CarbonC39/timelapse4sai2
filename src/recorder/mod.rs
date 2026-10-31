@@ -1,4 +1,5 @@
 mod scheduler;
+pub mod matching;
 pub mod storage;
 #[cfg(test)]
 mod tests;
@@ -32,6 +33,7 @@ pub struct Config {
     pub checkpoint_every_events: u64,
     pub checkpoint_changed_ratio: u32,
     pub no_input_watch: bool,
+    pub allow_canvas_mismatch: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -43,6 +45,7 @@ impl Default for Config {
             checkpoint_every_events: 500,
             checkpoint_changed_ratio: 70,
             no_input_watch: false,
+            allow_canvas_mismatch: false,
         }
     }
 }
@@ -52,8 +55,12 @@ impl Config {
         let mut i = 0;
         while i < args.len() {
             let flag = &args[i];
-            if flag == "--no-input-watch" {
-                c.no_input_watch = true;
+            if flag == "--no-input-watch" || flag == "--allow-canvas-mismatch" {
+                if flag == "--no-input-watch" {
+                    c.no_input_watch = true;
+                } else {
+                    c.allow_canvas_mismatch = true;
+                }
                 i += 1;
                 continue;
             }
@@ -109,6 +116,7 @@ pub enum Message {
     Tile(storage::Coord, u128, Vec<u8>),
     End,
     Abort,
+    Metadata(Canvas),
 }
 #[derive(Default)]
 pub struct CaptureState {
@@ -139,7 +147,7 @@ impl CaptureState {
         let canvas = reader
             .canvases()?
             .into_iter()
-            .find(|c| c.address == identity.address && c.id == identity.id)
+            .find(|c| c.same_live_identity(identity))
             .ok_or("selected canvas closed or replaced; stop recording")?;
         let map = reader.read_tile_map(&canvas)?;
         let resized = (self.width, self.height) != (canvas.width, canvas.height);
@@ -184,8 +192,10 @@ impl CaptureState {
                 }
             }
             reader.validate_tile_map(&canvas, &map)?;
-            if reader.read_canvas(canvas.address)? != canvas
-                || !reader.canvases()?.contains(&canvas)
+            let after = reader.read_canvas(canvas.address)?;
+            if !after.same_live_identity(&canvas)
+                || (after.width, after.height) != (canvas.width, canvas.height)
+                || !reader.canvases()?.iter().any(|c| c.same_live_identity(&canvas))
             {
                 return Err("canvas changed during capture; retry".into());
             }
@@ -196,6 +206,7 @@ impl CaptureState {
                 send(tx, Message::End)?;
                 self.width = canvas.width;
                 self.height = canvas.height;
+                send(tx, Message::Metadata(canvas))?;
                 self.hashes = hashes;
                 Ok(())
             }
@@ -220,6 +231,8 @@ fn recording_manifest<M: ProcessMemory>(reader: &Reader<M>, canvas: &Canvas) -> 
         initial_height: canvas.height,
         canvas_name: canvas.name.clone(),
         canvas_path: canvas.short_path.clone(),
+        latest_canvas_name: None,
+        latest_canvas_path: None,
         tile_size: 256,
         channel_order: "BGRX (X and edge padding zeroed)".into(),
         creation_time_unix_ms: timestamp(),
@@ -249,7 +262,7 @@ pub fn record_with_status<M: ProcessMemory>(
     config: Config,
     observer: impl FnMut(storage::RecordingStats) + Send + 'static,
 ) -> Result<Metrics, String> {
-    record_inner(reader, canvas, dir, config, &STOP, true, observer)
+    record_inner(reader, canvas, dir, config, &STOP, true, 0, None, None::<fn(&Manifest, matching::SessionMatch) -> bool>, observer)
 }
 
 /// Record until `cancel` is set. This entry point does not install or modify the
@@ -262,7 +275,21 @@ pub fn record_cancellable<M: ProcessMemory>(
     cancel: &AtomicBool,
     observer: impl FnMut(storage::RecordingStats) + Send + 'static,
 ) -> Result<Metrics, String> {
-    record_inner(reader, canvas, dir, config, cancel, false, observer)
+    record_inner(reader, canvas, dir, config, cancel, false, 0, None, None::<fn(&Manifest, matching::SessionMatch) -> bool>, observer)
+}
+
+pub fn record_cancellable_with_match<M: ProcessMemory>(
+    reader: &Reader<M>,
+    canvas: &Canvas,
+    dir: &Path,
+    config: Config,
+    cancel: &AtomicBool,
+    pid: u32,
+    previous: Option<matching::LiveCanvasIdentity>,
+    authorize: impl FnOnce(&Manifest, matching::SessionMatch) -> bool,
+    observer: impl FnMut(storage::RecordingStats) + Send + 'static,
+) -> Result<Metrics, String> {
+    record_inner(reader, canvas, dir, config, cancel, false, pid, previous, Some(authorize), observer)
 }
 
 fn record_inner<M: ProcessMemory>(
@@ -272,6 +299,9 @@ fn record_inner<M: ProcessMemory>(
     config: Config,
     cancel: &AtomicBool,
     use_signal: bool,
+    pid: u32,
+    previous: Option<matching::LiveCanvasIdentity>,
+    authorize: Option<impl FnOnce(&Manifest, matching::SessionMatch) -> bool>,
     mut observer: impl FnMut(storage::RecordingStats) + Send + 'static,
 ) -> Result<Metrics, String> {
     let mut input = if config.no_input_watch {
@@ -279,8 +309,33 @@ fn record_inner<M: ProcessMemory>(
     } else {
         Some(crate::process::InputWatcher::new()?)
     };
+    let current = reader
+        .canvases()?
+        .into_iter()
+        .find(|c| c.same_live_identity(canvas))
+        .ok_or("selected canvas closed or replaced; select the canvas again")?;
+    let canvas = &current;
     let manifest = recording_manifest(reader, canvas);
     let mut store = Store::open(dir, manifest, config.clone())?;
+    if !store.is_new() {
+        let decision = matching::SessionMatch::classify(store.manifest(), canvas, previous, pid);
+        if decision.requires_confirmation() && !config.allow_canvas_mismatch {
+            if let Some(authorize) = authorize {
+                if !authorize(store.manifest(), decision) {
+                    return Err("Recording cancelled.".into());
+                }
+            } else {
+                decision.ensure_allowed(false)?;
+            }
+        }
+        if let Some(warning) = matching::build_warning(
+            store.manifest(),
+            reader.source_hash.unwrap_or(reader.profile.executable_hash),
+        ) {
+            store.warnings.push(warning);
+        }
+    }
+    store.update_canvas_metadata(canvas)?;
     if use_signal {
         STOP.store(false, Ordering::Relaxed);
         crate::process::install_stop_handler(&STOP)?;
@@ -311,6 +366,13 @@ fn record_inner<M: ProcessMemory>(
                 }
                 Message::End => store.end()?,
                 Message::Abort => store.abort(),
+                Message::Metadata(canvas) => {
+                    if store.manifest().effective_canvas_name() != canvas.name
+                        || store.manifest().effective_canvas_path() != canvas.short_path
+                    {
+                        store.update_canvas_metadata(&canvas)?;
+                    }
+                }
             }
             store.persist_stats_if_due()?;
             if last_update.elapsed().as_millis() >= 250 {
@@ -339,7 +401,14 @@ fn record_inner<M: ProcessMemory>(
         capture.capture(reader, canvas, FrameKind::Stable, &tx, &mut metrics)?;
         scheduler.captured(start.elapsed().as_millis() as u64, FrameKind::Stable);
         let mut failures = 0;
+        let mut last_live_check = Instant::now();
         while !cancel.load(Ordering::Relaxed) {
+            if last_live_check.elapsed().as_millis() >= 100 {
+                if !reader.canvases()?.iter().any(|c| c.same_live_identity(canvas)) {
+                    return Err("selected canvas closed or replaced; select the canvas again".into());
+                }
+                last_live_check = Instant::now();
+            }
             let now = start.elapsed().as_millis() as u64;
             if let Some(input) = input.as_mut() {
                 if input.poll_activity(now)? {

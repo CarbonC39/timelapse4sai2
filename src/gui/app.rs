@@ -25,6 +25,7 @@ use timelapse4sai2::{
     preview::PreviewImage,
     recorder::{
         self,
+        matching::{LiveCanvasIdentity, SessionMatch},
         storage::{RecordingStats, Session, SessionSummary},
     },
     sai::{canvas::Canvas, profile::CompatibilityStatus},
@@ -60,6 +61,7 @@ enum Message {
     RecordingPath(u64, Result<Option<SessionSummary>, String>),
     ExportProgress(u64, u64),
     Stats(RecordingStats),
+    RecordingStarted(PathBuf, LiveCanvasIdentity),
     Recorded(Result<Vec<String>, String>),
     Exported(Result<Vec<String>, String>),
     Path(Dialog, Option<PathBuf>),
@@ -111,6 +113,7 @@ pub struct App {
     plan_due: Option<std::time::Instant>,
     plan_running: bool,
     export_progress: (u64, u64),
+    previous_live: std::collections::HashMap<PathBuf, LiveCanvasIdentity>,
 }
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -161,6 +164,7 @@ impl App {
             plan_due: None,
             plan_running: false,
             export_progress: (0, 0),
+            previous_live: std::collections::HashMap::new(),
         };
         app.refresh_connection();
         app
@@ -236,11 +240,7 @@ impl App {
                         let current = connection
                             .canvases
                             .iter()
-                            .find(|c| {
-                                c.address == canvas.address
-                                    && c.id == canvas.id
-                                    && c.name == canvas.name
-                            })
+                            .find(|c| canvas.same_live_identity(c))
                             .ok_or_else(|| i18n.tr(Key::ErrorNoCanvas).to_owned())?;
                         PreviewImage::from_live(&connection.reader(), current, 512, 512 * 512)
                     })(),
@@ -435,23 +435,61 @@ impl App {
         let stop = self.stop.clone();
         let config = self.config.clone();
         let dir = PathBuf::from(&self.session_path);
+        let session_key = recorder::matching::session_key(&dir);
+        let previous = self.previous_live.get(&session_key).copied();
+        let identity = LiveCanvasIdentity::new(pid, &canvas);
         let tx = self.tx.clone();
-        let i18n = self.i18n();
+        let message_dir = dir.clone();
+        let mut started_sent = false;
         self.launch(move || {
             Message::Recorded((|| {
                 let connection = Connection::discover(Some(pid))?;
+                if connection.compatibility == CompatibilityStatus::NeedsCanvas {
+                    return Err("Open a canvas in SAI2, then refresh and select it again.".to_owned());
+                }
                 let current = connection
                     .canvases
                     .iter()
-                    .find(|c| **c == canvas)
-                    .ok_or_else(|| i18n.tr(Key::ErrorNoCanvas).to_owned())?;
-                recorder::record_cancellable(
+                    .find(|c| canvas.same_live_identity(c))
+                    .ok_or_else(|| "The selected drawing is no longer available. Refresh and select it again.".to_owned())?;
+                let current_name = current.name.clone();
+                let current_path = current.short_path.clone();
+                recorder::record_cancellable_with_match(
                     &connection.reader(),
                     current,
                     &dir,
                     config,
                     &stop,
+                    pid,
+                    previous,
+                    move |manifest, relation| {
+                        if !matches!(relation, SessionMatch::Ambiguous | SessionMatch::DifferentCanvas) {
+                            return true;
+                        }
+                        let old_name = manifest.effective_canvas_name();
+                        let old_path = manifest.effective_canvas_path();
+                        let (title, detail) = if relation == SessionMatch::Ambiguous {
+                            let saved_path = if old_path.is_empty() { "(unsaved or unavailable)" } else { old_path };
+                            let current_path = if current_path.is_empty() { "(unsaved or unavailable)" } else { &current_path };
+                            ("Confirm recording session", format!("A canvas path is missing, so these canvases cannot be verified as the same drawing.\n\nSession canvas: {old_name}\nSession path: {saved_path}\n\nCurrent canvas: {current_name}\nCurrent path: {current_path}"))
+                        } else {
+                            ("Confirm recording session", format!("This session belongs to a different canvas. Recording will append another drawing to it.\n\nSession canvas: {old_name}\nSession path: {old_path}\n\nCurrent canvas: {current_name}\nCurrent path: {current_path}"))
+                        };
+                        rfd::MessageDialog::new()
+                            .set_title(title)
+                            .set_description(&detail)
+                            .set_buttons(rfd::MessageButtons::OkCancelCustom(
+                                "Continue recording".into(),
+                                "Cancel".into(),
+                            ))
+                            .show()
+                            == rfd::MessageDialogResult::Custom("Continue recording".into())
+                    },
                     move |stats| {
+                        if stats.captures > 0 && !started_sent {
+                            started_sent = true;
+                            let _ = tx.send(Message::RecordingStarted(message_dir.clone(), identity));
+                        }
                         let _ = tx.send(Message::Stats(stats));
                     },
                 )
@@ -491,10 +529,10 @@ impl App {
                             let old = self
                                 .detected
                                 .as_ref()
-                                .and_then(|d| d.canvases.get(self.selected))
-                                .cloned();
+                                .and_then(|d| d.canvases.get(self.selected).map(|c| (d.pid, c)))
+                                .map(|(pid, c)| LiveCanvasIdentity::new(pid, c));
                             self.selected = old
-                                .and_then(|c| d.canvases.iter().position(|v| v == &c))
+                                .and_then(|identity| d.canvases.iter().position(|c| identity.matches(d.pid, c)))
                                 .unwrap_or(0);
                             self.detected = Some(d);
                             self.connection_error = None;
@@ -567,6 +605,10 @@ impl App {
                         self.remember_current_session();
                     }
                 }
+                Message::RecordingStarted(path, identity) => {
+                    let key = recorder::matching::session_key(&path);
+                    self.previous_live.insert(key, identity);
+                }
                 Message::Recorded(result) => {
                     self.recording = match result {
                         Ok(warnings) => {
@@ -574,6 +616,7 @@ impl App {
                             self.remember_current_session();
                             RecordingState::Idle
                         }
+                        Err(e) if e == "Recording cancelled." => RecordingState::Idle,
                         Err(e) => RecordingState::Error(e),
                     };
                     self.session_revision += 1;

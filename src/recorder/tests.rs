@@ -25,6 +25,8 @@ fn manifest() -> Manifest {
         initial_width: 257,
         initial_height: 1,
         canvas_name: "synthetic".into(),
+        latest_canvas_name: None,
+        latest_canvas_path: None,
         canvas_path: "synthetic.sai".into(),
         tile_size: 256,
         channel_order: "BGRX".into(),
@@ -59,6 +61,132 @@ fn cancellable_recording_drains_initial_capture_and_reports_final_stats() {
     fs::remove_dir_all(path).unwrap();
 }
 
+#[test]
+fn latest_canvas_metadata_survives_reopen_and_summary_uses_it() {
+    let path = dir("latest-metadata");
+    {
+        let mut store = Store::open(&path, manifest(), Config::default()).unwrap();
+        store.update_latest_canvas_metadata("Renamed canvas".into(), "D:/work/new.sai".into()).unwrap();
+    }
+    let session = storage::Session::open(&path).unwrap();
+    assert_eq!(session.manifest.canvas_name, "synthetic");
+    assert_eq!(session.manifest.canvas_path, "synthetic.sai");
+    assert_eq!(session.manifest.effective_canvas_name(), "Renamed canvas");
+    assert_eq!(session.manifest.effective_canvas_path(), "D:/work/new.sai");
+    assert_eq!(session.summary().unwrap().canvas_name, "Renamed canvas");
+    drop(session);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn changed_build_warns_and_different_saved_canvas_requires_override() {
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    let mem = fixture::fixture();
+    let base_reader = Reader {
+        resolved_root_rva: None,
+        source_hash: Some("changed-build"),
+        memory: &mem,
+        base: fixture::BASE,
+        profile: &PROFILE,
+    };
+    let canvas = base_reader.canvases().unwrap().remove(0);
+    let path = dir("matching");
+    {
+        let mut store = Store::open(&path, manifest(), Config::default()).unwrap();
+        store.update_canvas_metadata(&canvas).unwrap();
+    }
+    let cancel = Arc::new(AtomicBool::new(true));
+    let metrics = record_cancellable_with_match(
+        &base_reader,
+        &canvas,
+        &path,
+        Config { no_input_watch: true, ..Config::default() },
+        &cancel,
+        42,
+        None,
+        |_, _| false,
+        |_| {},
+    ).unwrap();
+    assert!(metrics.warnings.iter().any(|warning| warning.contains("different SAI2 build")));
+
+    let mut wrong_canvas = canvas.clone();
+    wrong_canvas.short_path = "D:/elsewhere/other.sai".into();
+    {
+        let mut store = Store::open(&path, manifest(), Config::default()).unwrap();
+        store.update_canvas_metadata(&wrong_canvas).unwrap();
+    }
+    let rejected = record_cancellable(
+        &base_reader,
+        &canvas,
+        &path,
+        Config { no_input_watch: true, ..Config::default() },
+        &cancel,
+        |_| {},
+    );
+    assert!(rejected.unwrap_err().contains("--allow-canvas-mismatch"));
+
+    let allowed = record_cancellable(
+        &base_reader,
+        &canvas,
+        &path,
+        Config { no_input_watch: true, allow_canvas_mismatch: true, ..Config::default() },
+        &cancel,
+        |_| {},
+    );
+    assert!(allowed.is_ok());
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn same_live_canvas_updates_metadata_across_unsaved_save_and_save_as() {
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    let mut mem = fixture::fixture();
+    mem.utf16(fixture::CANVAS + 0x2ac, "Untitled\0");
+    mem.put(fixture::CANVAS + 0x4ac, &[0, 0]);
+    let path = dir("save-rounds");
+    let cancel = Arc::new(AtomicBool::new(true));
+    let config = Config { no_input_watch: true, ..Config::default() };
+    let identity = {
+        let (reader, canvas) = fixture_reader(&mem);
+        let identity = matching::LiveCanvasIdentity::new(42, &canvas);
+        record_cancellable_with_match(
+            &reader, &canvas, &path, config.clone(), &cancel, 42, None,
+            |_, _| panic!("first recording should not request authorization"), |_| {},
+        ).unwrap();
+        identity
+    };
+
+    mem.utf16(fixture::CANVAS + 0x2ac, "Project\0");
+    mem.utf16(fixture::CANVAS + 0x4ac, "D:/work/project.sai\0");
+    {
+        let (reader, canvas) = fixture_reader(&mem);
+        record_cancellable_with_match(
+            &reader, &canvas, &path, config.clone(), &cancel, 42, Some(identity),
+            |_, _| panic!("same live canvas should not request authorization"), |_| {},
+        ).unwrap();
+    }
+
+    mem.utf16(fixture::CANVAS + 0x2ac, "Renamed\0");
+    mem.utf16(fixture::CANVAS + 0x4ac, "D:/work/renamed.sai\0");
+    {
+        let (reader, canvas) = fixture_reader(&mem);
+        record_cancellable_with_match(
+            &reader, &canvas, &path, config, &cancel, 42, Some(identity),
+            |_, _| panic!("same live canvas should not request authorization"), |_| {},
+        ).unwrap();
+    }
+
+    let session = storage::Session::open(&path).unwrap();
+    assert_eq!(session.manifest.canvas_name, "Untitled");
+    assert_eq!(session.manifest.canvas_path, "");
+    assert_eq!(session.manifest.effective_canvas_name(), "Renamed");
+    assert_eq!(session.manifest.effective_canvas_path(), "D:/work/renamed.sai");
+    drop(session);
+    fs::remove_dir_all(path).unwrap();
+}
+
 fn fixture_reader(
     mem: &fixture::FakeMemory,
 ) -> (Reader<'_, fixture::FakeMemory>, crate::sai::canvas::Canvas) {
@@ -80,6 +208,7 @@ fn apply(store: &mut Store, rx: &mpsc::Receiver<Message>) {
             Message::Tile(c, id, raw) => store.tile(c, id, &raw).unwrap(),
             Message::End => store.end().unwrap(),
             Message::Abort => store.abort(),
+            Message::Metadata(canvas) => store.update_canvas_metadata(&canvas).unwrap(),
         }
     }
 }
@@ -189,7 +318,7 @@ fn changed_tile_candidate_sends_only_the_changed_tile() {
         let messages: Vec<_> = rx.try_iter().collect();
         assert!(matches!(
             messages.as_slice(),
-            [Message::Begin(..), Message::Tile((1, 0), ..), Message::End]
+            [Message::Begin(..), Message::Tile((1, 0), ..), Message::End, Message::Metadata(_)]
         ));
         for msg in messages {
             match msg {
@@ -197,6 +326,7 @@ fn changed_tile_candidate_sends_only_the_changed_tile() {
                 Message::Tile(c, id, raw) => store.tile(c, id, &raw).unwrap(),
                 Message::End => store.end().unwrap(),
                 Message::Abort => store.abort(),
+                Message::Metadata(canvas) => store.update_canvas_metadata(&canvas).unwrap(),
             }
         }
         assert_eq!(store.metrics.provisional_frames, 1);

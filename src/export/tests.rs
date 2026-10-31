@@ -40,6 +40,8 @@ impl Fixture {
             initial_width: 257,
             initial_height: 1,
             canvas_name: "fixture".into(),
+            latest_canvas_name: None,
+            latest_canvas_path: None,
             canvas_path: "/fixture".into(),
             tile_size: 256,
             channel_order: "BGRX".into(),

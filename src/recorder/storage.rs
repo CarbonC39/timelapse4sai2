@@ -71,11 +71,23 @@ pub struct Manifest {
     pub initial_height: u32,
     pub canvas_name: String,
     pub canvas_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_canvas_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_canvas_path: Option<String>,
     pub tile_size: u32,
     pub channel_order: String,
     pub creation_time_unix_ms: u64,
     pub recorder_version: String,
     pub identity_limit: String,
+}
+impl Manifest {
+    pub fn effective_canvas_name(&self) -> &str {
+        self.latest_canvas_name.as_deref().unwrap_or(&self.canvas_name)
+    }
+    pub fn effective_canvas_path(&self) -> &str {
+        self.latest_canvas_path.as_deref().unwrap_or(&self.canvas_path)
+    }
 }
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -208,6 +220,8 @@ pub fn disk_bytes(dir: &Path) -> Result<u64, String> {
 
 pub struct Store {
     dir: std::path::PathBuf,
+    manifest: Manifest,
+    is_new: bool,
     pub stats: SessionStats,
     pub warnings: Vec<String>,
     run_started: Option<Instant>,
@@ -230,16 +244,11 @@ impl Store {
             return Err("session is already open by another recorder".into());
         }
         let path = dir.join("manifest.json");
-        if path.exists() {
+        let is_new = !path.try_exists().map_err(err)?;
+        let manifest = if !is_new {
             let old: Manifest =
                 serde_json::from_slice(&fs::read(&path).map_err(err)?).map_err(err)?;
-            if old.format_version != 1
-                || old.source_executable_md5 != manifest.source_executable_md5
-                || old.canvas_name != manifest.canvas_name
-                || old.canvas_path != manifest.canvas_path
-            {
-                return Err("session manifest does not match canvas/profile".into());
-            }
+            old
         } else {
             let mut f = OpenOptions::new()
                 .write(true)
@@ -252,11 +261,18 @@ impl Store {
             f.sync_all().map_err(err)?;
             fs::rename(dir.join("manifest.tmp"), &path).map_err(err)?;
             crate::process::sync_directory(dir).map_err(err)?;
+            manifest
+        };
+        if manifest.format_version != 1
+            || manifest.tile_size != 256
+            || !manifest.channel_order.starts_with("BGRX")
+        {
+            return Err("unsupported session format, tile size or channel order".into());
         }
         let (mut stats, warnings) = read_stats(dir);
         stats.clear_captures();
         let mut s = Self {
-            dir: dir.to_owned(), stats, warnings, run_started: None, last_stats_flush: None,
+            dir: dir.to_owned(), manifest, is_new, stats, warnings, run_started: None, last_stats_flush: None,
             _lock: lock,
             blobs: open(&dir.join("blobs.bin"))?,
             timeline: open(&dir.join("timeline.bin"))?,
@@ -296,6 +312,26 @@ impl Store {
             s.warnings.push(format!("Could not repair stats.json cache: {e}"));
         }
         Ok(s)
+    }
+    pub fn update_latest_canvas_metadata(&mut self, name: String, path: String) -> Result<(), String> {
+        self.manifest.latest_canvas_name = Some(name);
+        self.manifest.latest_canvas_path = Some(path);
+        let manifest_path = self.dir.join("manifest.json");
+        let temp_path = self.dir.join("manifest.tmp");
+        let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&temp_path).map_err(err)?;
+        file.write_all(&serde_json::to_vec_pretty(&self.manifest).map_err(err)?).map_err(err)?;
+        file.sync_all().map_err(err)?;
+        fs::rename(temp_path, manifest_path).map_err(err)?;
+        crate::process::sync_directory(&self.dir).map_err(err)
+    }
+    pub fn is_new(&self) -> bool {
+        self.is_new
+    }
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+    pub fn update_canvas_metadata(&mut self, canvas: &Canvas) -> Result<(), String> {
+        self.update_latest_canvas_metadata(canvas.name.clone(), canvas.short_path.clone())
     }
     pub fn start_recording(&mut self) -> Result<(), String> {
         if self.run_started.is_none() {
@@ -561,7 +597,7 @@ impl Session {
             initial_height: self.manifest.initial_height,
             current_width: self.current_width,
             current_height: self.current_height,
-            canvas_name: self.manifest.canvas_name.clone(),
+            canvas_name: self.manifest.effective_canvas_name().to_owned(),
         })
     }
     pub fn position(&mut self) -> Result<u64, String> {
@@ -616,7 +652,8 @@ mod stats_tests {
         let manifest = Manifest {
             format_version: 1, sai_profile: "test".into(), sai_generation: None,
             source_executable_md5: "test".into(), initial_width: 1, initial_height: 1,
-            canvas_name: "canvas".into(), canvas_path: "canvas".into(), tile_size: 256,
+            canvas_name: "canvas".into(), canvas_path: "canvas".into(),
+            latest_canvas_name: None, latest_canvas_path: None, tile_size: 256,
             channel_order: "BGRX".into(), creation_time_unix_ms: 0,
             recorder_version: "test".into(), identity_limit: "test".into(),
         };

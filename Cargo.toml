@@ -21,7 +21,7 @@ gui = ["dep:eframe", "dep:fontdb", "dep:rfd", "dep:open", "dep:winit"]
 [dependencies]
 eframe = { version = "0.33", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland", "persistence"] }
 fontdb = { version = "0.23", optional = true }
-rfd = { version = "0.15", optional = true }
+rfd = { version = "0.15", optional = true, features = ["common-controls-v6"] }
 open = { version = "5", optional = true }
 md5 = "0.7"
 png = "0.17"
