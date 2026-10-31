@@ -1,0 +1,178 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --all-features --locked
+      - name: Build
+        run: cargo build --release --all-features --locked
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="timelapse4sai2-${GITHUB_REF_NAME}-linux-x64"
+          mkdir -p "dist/$name"
+          install -m 755 target/release/timelapse4sai2 "dist/$name/"
+          install -m 755 target/release/timelapse4sai2-gui "dist/$name/"
+          cp README.md LICENSE shell.nix "dist/$name/"
+          cp docs/recording-format.md "dist/$name/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+      - name: Publish release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="${GITHUB_API_URL:-${GITHUB_SERVER_URL%/}/api/v1}"
+          repo="$GITHUB_REPOSITORY"
+          tag="${GITHUB_REF_NAME:-${GITHUB_REF#refs/tags/}}"
+          token="${TOKEN:-${GITHUB_TOKEN:-}}"
+          if [ -z "$token" ]; then
+            echo "GITHUB_TOKEN is not available" >&2
+            exit 1
+          fi
+          asset_name="timelapse4sai2-$tag-linux-x64.tar.gz"
+          asset_file="$PWD/$asset_name"
+
+          release_file="$(mktemp)"
+          status="$(curl -sS -o "$release_file" -w '%{http_code}' \
+            -H "Authorization: token $token" \
+            "$api/repos/$repo/releases/tags/$tag")"
+          if [ "$status" = "404" ]; then
+            status="$(curl -sS -o "$release_file" -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: token $token" \
+              -H "Content-Type: application/json" \
+              --data "{\"tag_name\":\"$tag\",\"name\":\"timelapse4sai2 $tag\",\"body\":\"Automated release for $tag.\"}" \
+              "$api/repos/$repo/releases")"
+            if [ "$status" = "409" ]; then
+              status="$(curl -sS -o "$release_file" -w '%{http_code}' \
+                -H "Authorization: token $token" \
+                "$api/repos/$repo/releases/tags/$tag")"
+            fi
+          fi
+          if [ "$status" != "200" ] && [ "$status" != "201" ]; then
+            cat "$release_file" >&2
+            echo "Could not create or read release $tag (HTTP $status)" >&2
+            exit 1
+          fi
+          release_id="$(python3 -c \
+            'import json,sys; print(json.load(open(sys.argv[1]))["id"])' \
+            "$release_file")"
+
+          assets_file="$(mktemp)"
+          curl -sS -H "Authorization: token $token" \
+            "$api/repos/$repo/releases/$release_id/assets?limit=100" > "$assets_file"
+          old_id="$(python3 -c \
+            'import json,sys; name=sys.argv[1]; print(next((str(a["id"]) for a in json.load(open(sys.argv[2])) if a.get("name")==name), ""))' \
+            "$asset_name" "$assets_file")"
+          if [ -n "$old_id" ]; then
+            curl -sS -f -X DELETE -H "Authorization: token $token" \
+              "$api/repos/$repo/releases/$release_id/assets/$old_id" > /dev/null
+          fi
+
+          curl -sS -f -X POST -H "Authorization: token $token" \
+            -F "attachment=@$asset_file" \
+            "$api/repos/$repo/releases/$release_id/assets?name=$asset_name" > /dev/null
+          echo "Uploaded $asset_name"
+
+  windows:
+    runs-on: windows-latest
+    env:
+      TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --all-features --locked
+      - name: Build
+        run: cargo build --release --all-features --locked
+      - name: Package
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = if ($env:GITHUB_REF_NAME) {
+            $env:GITHUB_REF_NAME
+          } else {
+            $env:GITHUB_REF -replace '^refs/tags/', ''
+          }
+          $name = "timelapse4sai2-$tag-windows-x64"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item target/release/timelapse4sai2.exe "dist/$name/"
+          Copy-Item target/release/timelapse4sai2-gui.exe "dist/$name/"
+          Copy-Item README.md, LICENSE, docs/recording-format.md "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "$name.zip" -Force
+      - name: Publish release asset
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $api = if ($env:GITHUB_API_URL) {
+            $env:GITHUB_API_URL
+          } else {
+            "$($env:GITHUB_SERVER_URL.TrimEnd('/'))/api/v1"
+          }
+          $repo = $env:GITHUB_REPOSITORY
+          $tag = if ($env:GITHUB_REF_NAME) {
+            $env:GITHUB_REF_NAME
+          } else {
+            $env:GITHUB_REF -replace '^refs/tags/', ''
+          }
+          $token = if ($env:TOKEN) { $env:TOKEN } else { $env:GITHUB_TOKEN }
+          if (-not $token) { throw "GITHUB_TOKEN is not available" }
+          $assetName = "timelapse4sai2-$tag-windows-x64.zip"
+          $assetPath = Join-Path $PWD $assetName
+          $headers = @{ Authorization = "token $token" }
+
+          $release = $null
+          try {
+            $release = Invoke-RestMethod -Headers $headers `
+              -Uri "$api/repos/$repo/releases/tags/$tag"
+          } catch {
+            if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+          }
+          if (-not $release) {
+            $payload = @{
+              tag_name = $tag
+              name = "timelapse4sai2 $tag"
+              body = "Automated release for $tag."
+            } | ConvertTo-Json -Compress
+            try {
+              $release = Invoke-RestMethod -Method Post -Headers $headers `
+                -ContentType "application/json" -Body $payload `
+                -Uri "$api/repos/$repo/releases"
+            } catch {
+              if ($_.Exception.Response.StatusCode.value__ -eq 409) {
+                $release = Invoke-RestMethod -Headers $headers `
+                  -Uri "$api/repos/$repo/releases/tags/$tag"
+              } else {
+                throw
+              }
+            }
+          }
+
+          $assets = Invoke-RestMethod -Headers $headers `
+            -Uri "$api/repos/$repo/releases/$($release.id)/assets?limit=100"
+          foreach ($asset in @($assets)) {
+            if ($asset.name -eq $assetName) {
+              Invoke-RestMethod -Method Delete -Headers $headers `
+                -Uri "$api/repos/$repo/releases/$($release.id)/assets/$($asset.id)" |
+                Out-Null
+            }
+          }
+
+          curl.exe -sS -f -X POST -H "Authorization: token $token" `
+            -F "attachment=@$assetPath" `
+            "$api/repos/$repo/releases/$($release.id)/assets?name=$assetName"
+          if ($LASTEXITCODE -ne 0) {
+            throw "release asset upload failed"
+          }
+          Write-Host "Uploaded $assetName"
