@@ -67,8 +67,10 @@ cargo build --release --locked
 
 Ctrl-C / SIGTERM 停止调度，补一次 Stable candidate，排空队列并输出统计。
 既有目录会校验、恢复并继续追加，同一目录仅允许一个 writer。
-参数默认值统一在 Config 中，`--help` 可查看：idle-delay 150ms、min-capture-gap 300ms、
-max-active-gap 3000ms、zstd-level 1、checkpoint-every-events 500、checkpoint-changed-ratio 70。
+参数默认值统一在 Config 中，`--help` 可查看：idle-delay 100ms、min-capture-gap 250ms、
+max-active-gap 2500ms、zstd-level 1、checkpoint-every-events 500、checkpoint-changed-ratio 70。
+持续输入时以 2500ms 为调度阈值捕获；输入停止 100ms 后补一次 Stable candidate，
+但仍须满足 250ms 的最小捕获间隔。这些间隔可通过命令行参数调节。
 两个 checkpoint 参数各设为 0 禁用对应触发器；初始状态与 resize 始终保存 checkpoint。
 时间间隔按单调时钟独立计算，最小冷却优先；Unix timestamp 仅作 timeline 元数据。
 无输入监听时定时产生 Provisional candidate，停止时补 Stable candidate。

@@ -36,9 +36,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            idle_delay_ms: 150,
-            min_capture_gap_ms: 300,
-            max_active_gap_ms: 3000,
+            idle_delay_ms: 100,
+            min_capture_gap_ms: 250,
+            max_active_gap_ms: 2500,
             zstd_level: 1,
             checkpoint_every_events: 500,
             checkpoint_changed_ratio: 70,

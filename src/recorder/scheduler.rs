@@ -73,6 +73,30 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recorder::Config;
+
+    #[test]
+    fn default_cadence_captures_continuous_activity_and_short_pauses() {
+        let config = Config::default();
+        let mut s = Scheduler::new(
+            config.idle_delay_ms,
+            config.min_capture_gap_ms,
+            config.max_active_gap_ms,
+            0,
+        );
+        s.captured(0, FrameKind::Stable);
+        for now in (100..=2500).step_by(100) {
+            s.activity(now);
+            if now < 2500 {
+                assert_eq!(s.due(now), None);
+            }
+        }
+        assert_eq!(s.due(2500), Some(FrameKind::Provisional));
+        s.captured(2500, FrameKind::Provisional);
+        s.activity(2550);
+        assert_eq!(s.due(2749), None);
+        assert_eq!(s.due(2750), Some(FrameKind::Stable));
+    }
 
     #[test]
     fn delays_stable_until_idle_and_minimum_spacing() {
