@@ -139,6 +139,16 @@ snapshot while SAI is actively painting, so prefer idle moments for validation.
 The storage format and recovery guarantees are documented in
 [docs/recording-format.md](docs/recording-format.md).
 
+## Acknowledgements
+
+The following projects and documentation informed the implementation and design:
+
+- [cromachina/art-timelapse](https://github.com/cromachina/art-timelapse) —
+  reference for SAI2 memory layout, offsets, and the reverse-engineering approach.
+- [Krita documentation](https://docs.krita.org/) — engineering reference for
+  timelapse recording, replay, and session/storage design.
+
 ## License
 
-[AGPL-3.0-only](LICENSE)
+This project is licensed under the
+[GNU General Public License v3.0 only](LICENSE) (GPL-3.0-only).
