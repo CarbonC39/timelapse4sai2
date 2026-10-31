@@ -70,7 +70,6 @@ enum Dialog {
     OpenSession,
     SessionFolder,
     Output,
-    OutputPath,
 }
 
 pub struct App {
@@ -362,7 +361,7 @@ impl App {
                 Dialog::SessionFolder => rfd::FileDialog::new()
                     .set_title(i18n.tr(Key::ChooseDirectory))
                     .pick_folder(),
-                Dialog::Output | Dialog::OutputPath => {
+                Dialog::Output => {
                     let mut suggestion = suggested_output;
                     loop {
                         let mut picker = rfd::FileDialog::new()
@@ -604,9 +603,6 @@ impl App {
                         match dialog {
                             Dialog::OpenSession => self.open_session(path),
                             Dialog::SessionFolder => self.set_recording_path(path),
-                            Dialog::OutputPath => {
-                                self.output_path = path.to_string_lossy().into_owned()
-                            }
                             Dialog::Output => {
                                 let mut output = path;
                                 output.set_extension("mp4");
@@ -1003,20 +999,6 @@ impl App {
         let before = format!("{:?}", self.options);
         let editable = !self.recording_busy() && !self.export_busy() && !self.dialog_open;
         ui.add_enabled_ui(editable, |ui| {
-            form_row(ui, i18n, Key::Output, None, |ui| {
-                let width = (ui.available_width() - 28.0 - ui.spacing().item_spacing.x).max(0.0);
-                path_edit(ui, &mut self.output_path, width);
-                if icon_button(
-                    ui,
-                    Icon::Folder,
-                    i18n.tr(Key::ChooseOutput),
-                    !self.dialog_open,
-                )
-                .clicked()
-                {
-                    self.choose(Dialog::OutputPath);
-                }
-            });
             ui.columns(2, |columns| {
                 form_row(&mut columns[0], i18n, Key::Speed, None, |ui| {
                     egui::ComboBox::from_id_salt("speed")
