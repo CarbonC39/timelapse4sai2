@@ -8,6 +8,7 @@ use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontId, TextStyl
 use serde::{Deserialize, Serialize};
 
 use crate::gui::i18n::{Key, Language, Translator};
+use crate::gui::numeric_input::numeric_input;
 
 static SYSTEM_FONTS: OnceLock<Mutex<Option<Arc<Vec<SystemFont>>>>> = OnceLock::new();
 pub const MAX_RECENT_SESSIONS: usize = 5;
@@ -210,10 +211,12 @@ impl FontWindow {
                             .text(i18n.tr(Key::FontSize))
                             .show_value(false),
                     );
-                    ui.add(
-                        egui::DragValue::new(&mut settings.font_size)
-                            .range(10.0..=28.0)
-                            .suffix(i18n.tr(Key::PointSuffix)),
+                    numeric_input(
+                        ui,
+                        "font_size_numeric_input",
+                        &mut settings.font_size,
+                        10.0..=28.0,
+                        i18n.tr(Key::PointSuffix),
                     );
                 });
                 ui.horizontal(|ui| {

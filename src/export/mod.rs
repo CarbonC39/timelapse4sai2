@@ -17,8 +17,8 @@ use std::{
 };
 
 pub const HELP: &str = "timelapse4sai2 export SESSION_DIR OUTPUT.mp4 [OPTIONS]
-  --fps 30                    Output FPS (1..240); does not change drawing speed
-  --speed 1.0                 Drawing playback multiplier; 1x = 30 visual states/s
+  --fps 30                    Output FPS (1..240); does not change drawing duration
+  --pace <FLOAT>              Playback pace in visual captures per second (default 15; 0.1..1000)
   --encoder auto|nvenc|x264    Default auto; probes NVENC, falls back to libx264
   --quality draft|balanced|high|archival  Default balanced
   --size auto|720|1080|1440|2160|N%
@@ -35,10 +35,10 @@ pub const HELP: &str = "timelapse4sai2 export SESSION_DIR OUTPUT.mp4 [OPTIONS]
 Timestamps and idle time are ignored. Durations round to the nearest output frame.
 Output: H.264 MP4 / yuv420p; odd dimensions pad 1px on right/bottom.";
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Options {
     pub fps: u32,
-    pub speed: f64,
+    pub pace: f64,
     pub encoder: Encoder,
     pub quality: Quality,
     pub size: Size,
@@ -55,12 +55,36 @@ pub struct ExportPlan {
     pub selected_captures: u64,
     pub output_video_frames: u64,
     pub duration_ms: u64,
+    /// Ideal drawing duration before rounding to output video frames.
+    pub drawing_duration_s: f64,
     pub output_width: u32,
     pub output_height: u32,
     pub fps: u32,
-    pub speed: f64,
+    pub pace: f64,
     pub preview_end_ms: u64,
     pub hold_end_ms: u64,
+}
+
+impl ExportPlan {
+    /// Refresh timing from the selected capture count without rescanning a session.
+    /// Capture selection and output dimensions must already match the options.
+    pub fn update_timing(&mut self, options: &Options) -> Result<(), String> {
+        let timing = frame_map::timing(
+            self.selected_captures,
+            options.fps,
+            options.pace,
+            options.hold_end,
+            options.preview_end,
+        )?;
+        self.output_video_frames = timing.frame_count + timing.preview_count + timing.hold_count;
+        self.duration_ms = frames_to_ms(self.output_video_frames, options.fps);
+        self.drawing_duration_s = timing.drawing_duration_s;
+        self.fps = options.fps;
+        self.pace = options.pace;
+        self.preview_end_ms = frames_to_ms(timing.preview_count, options.fps);
+        self.hold_end_ms = frames_to_ms(timing.hold_count, options.fps);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,7 +103,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             fps: 30,
-            speed: 1.0,
+            pace: 15.0,
             encoder: Encoder::Auto,
             quality: Quality::Balanced,
             size: Size::Auto,
@@ -113,7 +137,7 @@ impl Options {
             if !matches!(
                 flag,
                 "--fps"
-                    | "--speed"
+                    | "--pace"
                     | "--encoder"
                     | "--quality"
                     | "--size"
@@ -134,7 +158,7 @@ impl Options {
             }
             match flag {
                 "--fps" => o.fps = number!(),
-                "--speed" => o.speed = number!(),
+                "--pace" => o.pace = number!(),
                 "--hold-end" => o.hold_end = number!(),
                 "--preview-end" => o.preview_end = number!(),
                 "--encoder" => o.encoder = Encoder::parse(v)?,
@@ -145,7 +169,7 @@ impl Options {
             }
             i += 2;
         }
-        FrameSchedule::new(vec![0], o.fps, o.speed, o.hold_end, o.preview_end)?;
+        FrameSchedule::new(vec![0], o.fps, o.pace, o.hold_end, o.preview_end)?;
         Ok(o)
     }
 }
@@ -293,7 +317,7 @@ fn prepare(session: &mut Session, options: &Options) -> Result<Prepared, String>
     let schedule = FrameSchedule::new(
         scan.states.clone(),
         options.fps,
-        options.speed,
+        options.pace,
         options.hold_end,
         options.preview_end,
     )?;
@@ -317,10 +341,11 @@ fn prepare(session: &mut Session, options: &Options) -> Result<Prepared, String>
         selected_captures: scan.states.len() as u64,
         output_video_frames: schedule.len(),
         duration_ms: frames_to_ms(schedule.len(), options.fps),
+        drawing_duration_s: schedule.drawing_duration_s(),
         output_width: spatial.width,
         output_height: spatial.height,
         fps: options.fps,
-        speed: options.speed,
+        pace: options.pace,
         preview_end_ms: frames_to_ms(schedule.preview_frames(), options.fps),
         hold_end_ms: frames_to_ms(schedule.hold_frames(), options.fps),
     };
@@ -415,17 +440,6 @@ pub fn run_with_progress(
     let mut completed = 0u64;
     let mut last_progress = Instant::now();
     progress(completed, total);
-    let mut final_frame = None;
-    if options.preview_end > 0.0 {
-        let final_state = final_replay(&mut session, &scanned)?;
-        final_frame =
-            Some(spatial.render(&final_state.rgb, final_state.width, final_state.height)?);
-    }
-    session.seek(0)?;
-    let mut replay = Replay::new(
-        session.manifest.initial_width,
-        session.manifest.initial_height,
-    )?;
     let mut writer = VideoWriter::start(
         output,
         spatial.width,
@@ -435,44 +449,89 @@ pub fn run_with_progress(
         options.quality,
         options.overwrite,
     )?;
-    let mut next_batch = 0usize;
-    let mut cached = None;
-    let mut previous = None;
-    for target in schedule.frames() {
-        if target != Target::Final && Some(target) != previous {
-            let Target::State(batch) = target else {
-                unreachable!()
-            };
-            while next_batch <= batch {
-                let events = session
-                    .next_batch()?
-                    .ok_or("session ended unexpectedly during replay")?;
-                apply_batch(&mut replay, &events, &mut session)?;
-                next_batch += 1;
-            }
-            cached = Some(spatial.render(&replay.rgb, replay.width, replay.height)?);
-        }
-        if target == Target::Final && final_frame.is_none() {
-            while let Some(events) = session.next_batch()? {
-                apply_batch(&mut replay, &events, &mut session)?;
-            }
-            final_frame = Some(spatial.render(&replay.rgb, replay.width, replay.height)?);
-        }
-        let pixels = if target == Target::Final {
-            final_frame.as_ref()
-        } else {
-            cached.as_ref()
-        };
-        writer.write_frame(pixels.ok_or("missing rendered frame")?)?;
+    render_frames(&mut session, &scanned, &schedule, &spatial, |pixels| {
+        writer.write_frame(pixels)?;
         completed += 1;
         if last_progress.elapsed() >= Duration::from_millis(100) || completed == total {
             progress(completed, total);
             last_progress = Instant::now();
         }
-        previous = Some(target);
-    }
+        Ok(())
+    })?;
     writer.finish()?;
     Ok(ExportReport { plan, warnings })
+}
+
+/// Render the schedule in order, sharing the first drawing image across the
+/// opening crossfade and the drawing phase, and streaming pixels to the encoder.
+fn render_frames(
+    session: &mut Session,
+    scanned: &Scan,
+    schedule: &FrameSchedule,
+    spatial: &Spatial,
+    mut emit: impl FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut final_frame = if schedule.preview_frames() > 0 {
+        let final_state = final_replay(session, scanned)?;
+        Some(spatial.render(&final_state.rgb, final_state.width, final_state.height)?)
+    } else {
+        None
+    };
+    session.seek(0)?;
+    let mut replay = Replay::new(
+        session.manifest.initial_width,
+        session.manifest.initial_height,
+    )?;
+    let mut next_batch = 0usize;
+    let mut cached_batch = None;
+    let mut cached = None;
+    let mut blended = Vec::new();
+    for target in schedule.frames() {
+        let batch = match target {
+            Target::State(batch) | Target::Crossfade { first: batch, .. } => Some(batch),
+            Target::Final => None,
+        };
+        if let Some(batch) = batch {
+            if cached_batch != Some(batch) {
+                while next_batch <= batch {
+                    let events = session
+                        .next_batch()?
+                        .ok_or("session ended unexpectedly during replay")?;
+                    apply_batch(&mut replay, &events, session)?;
+                    next_batch += 1;
+                }
+                cached = Some(spatial.render(&replay.rgb, replay.width, replay.height)?);
+                cached_batch = Some(batch);
+            }
+        }
+        if target == Target::Final && final_frame.is_none() {
+            while let Some(events) = session.next_batch()? {
+                apply_batch(&mut replay, &events, session)?;
+            }
+            final_frame = Some(spatial.render(&replay.rgb, replay.width, replay.height)?);
+        }
+        let pixels = match target {
+            Target::Final => final_frame.as_deref().ok_or("missing final frame")?,
+            Target::State(_) => cached.as_deref().ok_or("missing drawing frame")?,
+            Target::Crossfade { frame, frames, .. } => {
+                let final_pixels = final_frame.as_deref().ok_or("missing final frame")?;
+                let first_pixels = cached.as_deref().ok_or("missing first drawing frame")?;
+                let t = if frames <= 1 {
+                    1.0
+                } else {
+                    frame as f64 / (frames - 1) as f64
+                };
+                blended.resize(final_pixels.len(), 0);
+                for ((out, &end), &first) in blended.iter_mut().zip(final_pixels).zip(first_pixels)
+                {
+                    *out = (f64::from(end) * (1.0 - t) + f64::from(first) * t).round() as u8;
+                }
+                &blended
+            }
+        };
+        emit(pixels)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -480,11 +539,12 @@ mod tests {
     use super::*;
     #[test]
     fn parses_complete_cli_and_rejects_invalid_values() {
+        assert_eq!(Options::parse(&[]).unwrap().pace, 15.0);
         let args = [
             "--fps",
             "60",
-            "--speed",
-            "2",
+            "--pace",
+            "7.5",
             "--encoder",
             "nvenc",
             "--quality",
@@ -503,10 +563,10 @@ mod tests {
         .map(String::from);
         let o = Options::parse(&args).unwrap();
         assert_eq!(
-            (o.fps, o.speed, o.encoder, o.quality, o.size, o.canvas_mode),
+            (o.fps, o.pace, o.encoder, o.quality, o.size, o.canvas_mode),
             (
                 60,
-                2.0,
+                7.5,
                 Encoder::Nvenc,
                 Quality::High,
                 Size::P2160,
@@ -517,7 +577,9 @@ mod tests {
         assert_eq!(Size::parse("50%").unwrap(), Size::Percent(50));
         assert_eq!(Size::parse("720p").unwrap(), Size::P720);
         for args in [
-            vec!["--speed", "NaN"],
+            vec!["--pace", "NaN"],
+            vec!["--pace", "0.09"],
+            vec!["--pace", "1001"],
             vec!["--hold-end", "-1"],
             vec!["--fps", "0"],
             vec!["--encoder", "other"],
@@ -525,7 +587,7 @@ mod tests {
             vec!["--size", "0%"],
             vec!["--size", "500%"],
             vec!["--size", "half"],
-            vec!["--speed"],
+            vec!["--pace"],
             vec!["--extra"],
         ] {
             assert!(

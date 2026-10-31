@@ -198,12 +198,95 @@ fn public_plan_reports_filtered_captures_exact_timing_and_dimensions() {
         prepared.schedule.frames().count() as u64,
         prepared.plan.output_video_frames
     );
-    let plan = prepared.plan;
+    let mut plan = prepared.plan;
     assert_eq!(plan.source_captures, 5);
     assert_eq!(plan.selected_captures, 3);
-    assert_eq!(plan.output_video_frames, 7); // 3 visuals + 2 preview + 2 hold
-    assert_eq!(plan.duration_ms, 233);
+    assert_eq!(plan.output_video_frames, 10); // 6 drawing + 2 preview + 2 hold
+    assert_eq!(plan.duration_ms, 333);
     assert_eq!((plan.output_width, plan.output_height), (512, 2));
-    assert_eq!((plan.fps, plan.speed), (30, 1.0));
+    assert_eq!((plan.fps, plan.pace), (30, 15.0));
     assert_eq!((plan.preview_end_ms, plan.hold_end_ms), (67, 67));
+
+    // The GUI can update all timing controls immediately from an existing plan.
+    let updated = Options {
+        fps: 60,
+        pace: 7.5,
+        preview_end: 0.2,
+        hold_end: 1.0,
+        ..options
+    };
+    plan.update_timing(&updated).unwrap();
+    assert_eq!(plan, super::plan(&mut session, &updated).unwrap());
+    let valid = plan.clone();
+    assert!(
+        plan.update_timing(&Options {
+            pace: f64::NAN,
+            ..updated
+        })
+        .is_err()
+    );
+    assert_eq!(plan, valid);
+}
+
+#[test]
+fn render_crossfade_blends_final_into_first_drawing_and_holds_final() {
+    let fixture = Fixture::new();
+    fixture.session();
+    let mut session = Session::open(fixture.path()).unwrap();
+    let options = Options {
+        skip_provisional: true,
+        pace: 15.0,
+        fps: 30,
+        preview_end: 0.1,
+        hold_end: 0.1,
+        ..Options::default()
+    };
+    let prepared = super::prepare(&mut session, &options).unwrap();
+
+    let final_replay = final_replay(&mut session, &prepared.scan).unwrap();
+    let final_pixels = prepared
+        .spatial
+        .render(&final_replay.rgb, final_replay.width, final_replay.height)
+        .unwrap();
+
+    // The first selected state is batch zero. Render it through the same replay
+    // and spatial path used by export to get the expected opening drawing image.
+    session.seek(0).unwrap();
+    let mut first_replay = Replay::new(
+        session.manifest.initial_width,
+        session.manifest.initial_height,
+    )
+    .unwrap();
+    let first_batch = session.next_batch().unwrap().unwrap();
+    apply_batch(&mut first_replay, &first_batch, &mut session).unwrap();
+    let first_pixels = prepared
+        .spatial
+        .render(&first_replay.rgb, first_replay.width, first_replay.height)
+        .unwrap();
+    assert!(first_pixels.iter().any(|&pixel| pixel != 0));
+
+    let mut frames = Vec::new();
+    super::render_frames(
+        &mut session,
+        &prepared.scan,
+        &prepared.schedule,
+        &prepared.spatial,
+        |pixels| {
+            frames.push(pixels.to_vec());
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(frames.len(), 12); // 3 preview + 6 drawing + 3 hold
+    assert_eq!(frames[0], final_pixels); // Crossfade starts at the finished image.
+    let midpoint = final_pixels
+        .iter()
+        .zip(&first_pixels)
+        .map(|(&end, &first)| (f64::from(end) * 0.5 + f64::from(first) * 0.5).round() as u8)
+        .collect::<Vec<_>>();
+    assert_eq!(frames[1], midpoint);
+    assert_eq!(frames[2], first_pixels); // Last crossfade frame is drawing frame zero.
+    assert_eq!(frames[3], first_pixels);
+    assert!(frames[9..].iter().all(|frame| frame == &final_pixels));
 }

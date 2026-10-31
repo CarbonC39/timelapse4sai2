@@ -2,6 +2,7 @@ use super::{
     i18n::{
         Key, Translator, format_canvas, format_count, format_dimensions, format_duration,
     },
+    numeric_input::numeric_input,
     preview::Preview,
     settings::{FontWindow, Settings},
     widgets::{
@@ -1002,10 +1003,7 @@ impl App {
             1..=600000,
         );
         form_row(ui, i18n, Key::ZstdLevel, Some(Key::ZstdLevelTip), |ui| {
-            ui.add_sized(
-                [ui.available_width(), 28.0],
-                egui::DragValue::new(&mut self.config.zstd_level).range(-7..=22),
-            );
+            numeric_input(ui, "zstd_level", &mut self.config.zstd_level, -7..=22, "");
         });
         option_u64(
             ui,
@@ -1021,11 +1019,12 @@ impl App {
             Key::CheckpointRatio,
             Some(Key::CheckpointRatioTip),
             |ui| {
-                ui.add_sized(
-                    [ui.available_width(), 28.0],
-                    egui::DragValue::new(&mut self.config.checkpoint_changed_ratio)
-                        .range(0..=100)
-                        .suffix(i18n.tr(Key::PercentSuffix)),
+                numeric_input(
+                    ui,
+                    "checkpoint_ratio",
+                    &mut self.config.checkpoint_changed_ratio,
+                    0..=100,
+                    i18n.tr(Key::PercentSuffix),
                 );
             },
         );
@@ -1044,60 +1043,10 @@ impl App {
     fn export_ui(&mut self, ui: &mut egui::Ui) {
         let i18n = self.i18n();
         ui.heading(i18n.tr(Key::Export));
-        let before = format!("{:?}", self.options);
+        let before = clone_options(&self.options);
         let editable = !self.recording_busy() && !self.export_busy() && !self.dialog_open;
         ui.add_enabled_ui(editable, |ui| {
-            ui.columns(2, |columns| {
-                form_row(&mut columns[0], i18n, Key::Speed, None, |ui| {
-                    egui::ComboBox::from_id_salt("speed")
-                        .width(ui.available_width())
-                        .truncate()
-                        .selected_text(format!(
-                            "{}{}",
-                            self.options.speed,
-                            i18n.tr(Key::MultiplierSuffix)
-                        ))
-                        .show_ui(ui, |ui| {
-                            for speed in [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0] {
-                                if ui
-                                    .selectable_value(
-                                        &mut self.options.speed,
-                                        speed,
-                                        format!(
-                                            "{speed}{}",
-                                            i18n.tr(Key::MultiplierSuffix)
-                                        ),
-                                    )
-                                    .clicked()
-                                {
-                                    ui.close();
-                                }
-                            }
-                            ui.separator();
-                            ui.label(i18n.tr(Key::CustomSpeed));
-                            ui.add(
-                                egui::DragValue::new(&mut self.options.speed)
-                                    .range(0.01..=10000.0)
-                                    .speed(0.1)
-                                    .suffix(i18n.tr(Key::MultiplierSuffix)),
-                            );
-                        });
-                });
-                form_row(&mut columns[1], i18n, Key::Quality, None, |ui| {
-                    choice_combo(
-                        ui,
-                        i18n,
-                        "quality",
-                        &mut self.options.quality,
-                        &[
-                            (Quality::Draft, Key::Draft),
-                            (Quality::Balanced, Key::Balanced),
-                            (Quality::High, Key::High),
-                            (Quality::Archival, Key::Archival),
-                        ],
-                    );
-                });
-            });
+            export_controls(ui, i18n, &mut self.options);
         });
         ui.add_space(6.0);
         let duration = self
@@ -1169,17 +1118,30 @@ impl App {
                 ui.add_enabled_ui(editable, |ui| self.export_advanced_ui(ui));
             });
         }
-        if before != format!("{:?}", self.options) {
-            self.request_plan();
+        if before != self.options {
+            let same_selection_and_dimensions = before.skip_provisional
+                == self.options.skip_provisional
+                && before.encoder == self.options.encoder
+                && before.size == self.options.size
+                && before.canvas_mode == self.options.canvas_mode;
+            if same_selection_and_dimensions && let Some(plan) = &mut self.plan {
+                if let Err(error) = plan.update_timing(&self.options) {
+                    self.plan = None;
+                    self.exporting = ExportState::Error(error);
+                }
+            } else {
+                self.request_plan();
+                if !self.plan_running {
+                    self.launch_plan();
+                }
+            }
+            ui.ctx().request_repaint();
         }
     }
     fn export_advanced_ui(&mut self, ui: &mut egui::Ui) {
         let i18n = self.i18n();
         form_row(ui, i18n, Key::Fps, None, |ui| {
-            ui.add_sized(
-                [ui.available_width(), 28.0],
-                egui::DragValue::new(&mut self.options.fps).range(1..=240),
-            );
+            numeric_input(ui, "fps", &mut self.options.fps, 1..=240, "");
         });
         combo(
             ui,
@@ -1222,21 +1184,21 @@ impl App {
             ],
         );
         form_row(ui, i18n, Key::HoldEnd, None, |ui| {
-            ui.add_sized(
-                [ui.available_width(), 28.0],
-                egui::DragValue::new(&mut self.options.hold_end)
-                    .range(0.0..=3600.0)
-                    .speed(0.1)
-                    .suffix(i18n.tr(Key::SecondsSuffix)),
+            numeric_input(
+                ui,
+                "hold_end",
+                &mut self.options.hold_end,
+                0.0..=3600.0,
+                i18n.tr(Key::SecondsSuffix),
             );
         });
         form_row(ui, i18n, Key::PreviewEnd, None, |ui| {
-            ui.add_sized(
-                [ui.available_width(), 28.0],
-                egui::DragValue::new(&mut self.options.preview_end)
-                    .range(0.0..=3600.0)
-                    .speed(0.1)
-                    .suffix(i18n.tr(Key::SecondsSuffix)),
+            numeric_input(
+                ui,
+                "preview_end",
+                &mut self.options.preview_end,
+                0.0..=3600.0,
+                i18n.tr(Key::SecondsSuffix),
             );
         });
         form_row(ui, i18n, Key::SkipProvisional, None, |ui| {
@@ -1322,6 +1284,63 @@ impl eframe::App for App {
         self.settings.save(storage);
     }
 }
+fn export_controls(
+    ui: &mut egui::Ui,
+    i18n: Translator,
+    options: &mut Options,
+) -> [egui::Response; 2] {
+    let pace = form_row(ui, i18n, Key::Pace, Some(Key::PaceTip), |ui| {
+        pace_combo(ui, i18n, &mut options.pace)
+    });
+    let quality = form_row(ui, i18n, Key::Quality, None, |ui| {
+        choice_combo(
+            ui,
+            i18n,
+            "quality",
+            &mut options.quality,
+            &[
+                (Quality::Draft, Key::Draft),
+                (Quality::Balanced, Key::Balanced),
+                (Quality::High, Key::High),
+                (Quality::Archival, Key::Archival),
+            ],
+        )
+    });
+    [pace, quality]
+}
+
+fn pace_combo(ui: &mut egui::Ui, i18n: Translator, pace: &mut f64) -> egui::Response {
+    let unit = i18n.tr(Key::CapturesPerSecond);
+    let before = *pace;
+    let mut response = combo_button(ui, "pace", &format!("{pace} {unit}"));
+    egui::Popup::menu(&response)
+        .width(response.rect.width())
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            let mut selected = None;
+            for preset in [1.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0] {
+                if ui
+                    .selectable_label(*pace == preset, format!("{preset} {unit}"))
+                    .clicked()
+                {
+                    selected = Some(preset);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            ui.label(i18n.tr(Key::CustomPace));
+            numeric_input(ui, "custom_pace", pace, 0.1..=1000.0, unit);
+            // A preset takes priority over a custom draft submitted on blur.
+            if let Some(preset) = selected {
+                *pace = preset;
+            }
+        });
+    if *pace != before {
+        response.mark_changed();
+    }
+    response
+}
+
 /// GUI exports default to stable captures; the CLI keeps its documented
 /// default of including provisional states unless `--skip-provisional` is set.
 fn gui_options() -> Options {
@@ -1332,7 +1351,7 @@ fn gui_options() -> Options {
 fn clone_options(o: &Options) -> Options {
     Options {
         fps: o.fps,
-        speed: o.speed,
+        pace: o.pace,
         encoder: o.encoder,
         quality: o.quality,
         size: o.size,
@@ -1453,18 +1472,19 @@ fn option_u64(
     range: std::ops::RangeInclusive<u64>,
 ) {
     form_row(ui, i18n, label, Some(tip), |ui| {
-        ui.add_sized(
-            [ui.available_width(), 28.0],
-            egui::DragValue::new(value).range(range).suffix(
-                if matches!(
-                    label,
-                    Key::IdleDelay | Key::MinCaptureGap | Key::MaxActiveGap
-                ) {
-                    i18n.tr(Key::MillisecondsSuffix)
-                } else {
-                    ""
-                },
-            ),
+        numeric_input(
+            ui,
+            label,
+            value,
+            range,
+            if matches!(
+                label,
+                Key::IdleDelay | Key::MinCaptureGap | Key::MaxActiveGap
+            ) {
+                i18n.tr(Key::MillisecondsSuffix)
+            } else {
+                ""
+            },
         );
     });
 }
@@ -1496,53 +1516,22 @@ fn choice_combo<T: Copy + PartialEq>(
     id: &str,
     value: &mut T,
     choices: &[(T, Key)],
-) {
+) -> egui::Response {
     let text = choices
         .iter()
         .find(|(choice, _)| choice == value)
         .map(|(_, key)| i18n.tr(*key))
         .unwrap_or_default();
-    let width = ui.available_width().max(1.0);
-    let height = ui.spacing().interact_size.y.max(28.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    let response = ui
-        .interact(rect, ui.id().with(("choice-combo", id)), egui::Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    let visuals = ui.style().interact(&response);
-    ui.painter().rect(
-        rect,
-        4.0,
-        visuals.bg_fill,
-        visuals.bg_stroke,
-        egui::StrokeKind::Inside,
-    );
-    let text_color = visuals.fg_stroke.color;
-    let font = egui::TextStyle::Button.resolve(ui.style());
-    let text_painter = ui
-        .painter()
-        .with_clip_rect(rect.shrink2(egui::vec2(22.0, 0.0)));
-    text_painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        text,
-        font,
-        text_color,
-    );
-    let arrow = egui::pos2(rect.right() - 12.0, rect.center().y);
-    let stroke = egui::Stroke::new(1.4, text_color);
-    ui.painter()
-        .line_segment([arrow + egui::vec2(-4.0, -2.0), arrow + egui::vec2(0.0, 2.0)], stroke);
-    ui.painter()
-        .line_segment([arrow + egui::vec2(0.0, 2.0), arrow + egui::vec2(4.0, -2.0)], stroke);
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, ui.is_enabled(), text)
-    });
+    let response = combo_button(ui, id, text);
+    let height = response.rect.height();
     egui::Popup::menu(&response)
-        .width(rect.width())
+        .width(response.rect.width())
         .show(|ui| {
             for (index, (choice, key)) in choices.iter().enumerate() {
-                let (item_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+                let (item_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), height),
+                    egui::Sense::hover(),
+                );
                 let item = ui.interact(
                     item_rect,
                     ui.id().with(("choice-combo-item", id, index)),
@@ -1567,6 +1556,66 @@ fn choice_combo<T: Copy + PartialEq>(
                 }
             }
         });
+    response
+}
+
+fn combo_button(ui: &mut egui::Ui, id: &str, text: &str) -> egui::Response {
+    let width = ui.available_width().max(1.0);
+    let height = ui
+        .spacing()
+        .interact_size
+        .y
+        .max(ui.text_style_height(&egui::TextStyle::Button) + 8.0)
+        .max(28.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let response = ui
+        .interact(
+            rect,
+            ui.id().with(("choice-combo", id)),
+            egui::Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let visuals = ui.style().interact(&response);
+    ui.painter().rect(
+        rect,
+        4.0,
+        visuals.bg_fill,
+        visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let text_color = visuals.fg_stroke.color;
+    let mut font = egui::TextStyle::Button.resolve(ui.style());
+    let text_rect = rect.shrink2(egui::vec2(22.0, 0.0));
+    let text_width = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), text_color)
+        .size()
+        .x;
+    if text_width > text_rect.width() {
+        font.size *= text_rect.width().max(1.0) / text_width;
+    }
+    let text_painter = ui.painter().with_clip_rect(text_rect);
+    text_painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        font,
+        text_color,
+    );
+    let arrow = egui::pos2(rect.right() - 12.0, rect.center().y);
+    let stroke = egui::Stroke::new(1.4, text_color);
+    ui.painter().line_segment(
+        [arrow + egui::vec2(-4.0, -2.0), arrow + egui::vec2(0.0, 2.0)],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [arrow + egui::vec2(0.0, 2.0), arrow + egui::vec2(4.0, -2.0)],
+        stroke,
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, ui.is_enabled(), text)
+    });
+    response
 }
 
 #[cfg(test)]
@@ -1597,6 +1646,81 @@ mod tests {
         );
         assert!(settings.recent_sessions.is_empty());
     }
+    #[test]
+    fn export_units_and_quality_stay_separate_in_all_languages() {
+        use super::super::i18n::Language;
+        for language in [
+            Language::English,
+            Language::SimplifiedChinese,
+            Language::Japanese,
+        ] {
+            let i18n = Translator::new(language);
+            for screen_width in [440.0, 560.0, 1800.0] {
+                for font_size in [14.5, 28.0] {
+                    let ctx = egui::Context::default();
+                    Settings {
+                        font_size,
+                        ..Settings::default()
+                    }
+                    .apply(&ctx);
+                    let mut options = gui_options();
+                    let mut bounds = egui::Rect::NOTHING;
+                    let mut controls = [egui::Rect::NOTHING; 2];
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(screen_width, 900.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                centered_form(ui, |ui| {
+                                    bounds = ui.available_rect_before_wrap();
+                                    controls = export_controls(ui, i18n, &mut options)
+                                        .map(|response| response.rect);
+                                });
+                            });
+                        },
+                    );
+                    let text_rect = |key| {
+                        output
+                            .shapes
+                            .iter()
+                            .find_map(|clipped| {
+                                if let egui::Shape::Text(text) = &clipped.shape {
+                                    if text.galley.text().ends_with(i18n.tr(key)) {
+                                        let rect = clipped.shape.visual_bounding_rect();
+                                        assert!(clipped.clip_rect.expand(1.0).contains_rect(rect),
+                                            "{language:?} width={screen_width} font={font_size}: clipped export text");
+                                        return Some(rect);
+                                    }
+                                }
+                                None
+                            })
+                            .expect("export control text was rendered")
+                    };
+                    assert_eq!(controls[0].left(), controls[1].left());
+                    assert_eq!(controls[0].right(), controls[1].right());
+                    assert_eq!(controls[0].height(), controls[1].height());
+                    let unit = text_rect(Key::CapturesPerSecond);
+                    let quality = text_rect(Key::Quality);
+                    assert!(
+                        !unit.expand(2.0).intersects(quality),
+                        "{language:?} width={screen_width} font={font_size}: {unit:?} touches {quality:?}"
+                    );
+                    assert!(
+                        [unit, quality].iter().all(|rect| {
+                            rect.left() >= bounds.left() && rect.right() <= bounds.right()
+                        }),
+                        "{language:?} width={screen_width} font={font_size}: export text overflowed {bounds:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn centered_form_bounds_long_controls_in_narrow_and_tiled_windows() {
         let i18n = Translator::default();

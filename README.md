@@ -76,14 +76,14 @@ Inspect, verify, or export a finished session without SAI running:
 
 # Larger output, faster playback, final-artwork preview, and end hold.
 ./target/release/timelapse4sai2 export recordings/my-session artwork-high.mp4 \
-  --size 1080 --speed 2 --preview-end 3 --hold-end 3
+  --size 1080 --pace 60 --preview-end 3 --hold-end 3
 ```
 
 Useful export options:
 
 ```text
 --fps 30                 Output FPS
---speed 1.0              Drawing playback multiplier
+--pace 15                Playback pace in visual captures per second
 --encoder auto|nvenc|x264
 --quality draft|balanced|high|archival
 --size auto|720|1080|1440|2160|50%

@@ -1,5 +1,6 @@
 pub mod app;
 mod i18n;
+pub mod numeric_input;
 mod preview;
 mod settings;
 
