@@ -13,34 +13,34 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
+            container: ubuntu:22.04
             artifact: linux
           - os: windows-latest
             artifact: windows
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
     steps:
+      - name: Bootstrap Linux container
+        if: runner.os == 'Linux'
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git
       - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: bash scripts/linux-deps.sh
       - uses: dtolnay/rust-toolchain@stable
       - name: Test
         run: cargo test --all-features --locked
       - name: Build
         run: cargo build --release --all-features --locked
-      - name: Package (Linux)
+      - name: Package and smoke test (Linux)
         if: runner.os == 'Linux'
         shell: bash
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          set -euo pipefail
-          for edition in gui cli; do
-            name="timelapse4sai2-$TAG-linux-x64-$edition"
-            binary="timelapse4sai2"
-            if [ "$edition" = gui ]; then binary="timelapse4sai2-gui"; fi
-            mkdir -p "dist/$name"
-            install -m 755 "target/release/$binary" "dist/$name/"
-            cp README.md LICENSE shell.nix "dist/$name/"
-            tar -C dist -czf "$name.tar.gz" "$name"
-          done
+          bash scripts/package-linux.sh "$TAG"
+          bash scripts/smoke-linux.sh
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

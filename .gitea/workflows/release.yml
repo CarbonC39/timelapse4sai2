@@ -8,6 +8,7 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-latest
+    container: ubuntu:22.04
     strategy:
       matrix:
         edition: [gui, cli]
@@ -15,7 +16,10 @@ jobs:
       EDITION: ${{ matrix.edition }}
       TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - name: Bootstrap Linux container
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git
       - uses: actions/checkout@v4
+      - run: bash scripts/linux-deps.sh
       - uses: dtolnay/rust-toolchain@stable
       - name: Test
         run: cargo test --all-features --locked
@@ -24,14 +28,8 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          set -euo pipefail
-          name="timelapse4sai2-${GITHUB_REF_NAME}-linux-x64-$EDITION"
-          binary="timelapse4sai2"
-          if [ "$EDITION" = gui ]; then binary="timelapse4sai2-gui"; fi
-          mkdir -p "dist/$name"
-          install -m 755 "target/release/$binary" "dist/$name/"
-          cp README.md LICENSE shell.nix "dist/$name/"
-          tar -C dist -czf "$name.tar.gz" "$name"
+          bash scripts/package-linux.sh "${GITHUB_REF_NAME:-${GITHUB_REF#refs/tags/}}" "$EDITION"
+          bash scripts/smoke-linux.sh
       - name: Publish release asset
         shell: bash
         run: |
@@ -44,8 +42,6 @@ jobs:
             echo "GITHUB_TOKEN is not available" >&2
             exit 1
           fi
-          asset_name="timelapse4sai2-$tag-linux-x64-$EDITION.tar.gz"
-          asset_file="$PWD/$asset_name"
 
           release_file="$(mktemp)"
           status="$(curl -sS -o "$release_file" -w '%{http_code}' \
@@ -73,21 +69,25 @@ jobs:
             'import json,sys; print(json.load(open(sys.argv[1]))["id"])' \
             "$release_file")"
 
-          assets_file="$(mktemp)"
-          curl -sS -H "Authorization: token $token" \
-            "$api/repos/$repo/releases/$release_id/assets?limit=100" > "$assets_file"
-          old_id="$(python3 -c \
-            'import json,sys; name=sys.argv[1]; print(next((str(a["id"]) for a in json.load(open(sys.argv[2])) if a.get("name")==name), ""))' \
-            "$asset_name" "$assets_file")"
-          if [ -n "$old_id" ]; then
-            curl -sS -f -X DELETE -H "Authorization: token $token" \
-              "$api/repos/$repo/releases/$release_id/assets/$old_id" > /dev/null
-          fi
+          for asset_file in "$PWD/timelapse4sai2-$tag-linux-x64-$EDITION.tar.gz" "$PWD/timelapse4sai2-$tag-linux-x64-$EDITION.AppImage"; do
+            [ -f "$asset_file" ] || continue
+            asset_name="$(basename "$asset_file")"
+            assets_file="$(mktemp)"
+            curl -sS -H "Authorization: token $token" \
+              "$api/repos/$repo/releases/$release_id/assets?limit=100" > "$assets_file"
+            old_id="$(python3 -c \
+              'import json,sys; name=sys.argv[1]; print(next((str(a["id"]) for a in json.load(open(sys.argv[2])) if a.get("name")==name), ""))' \
+              "$asset_name" "$assets_file")"
+            if [ -n "$old_id" ]; then
+              curl -sS -f -X DELETE -H "Authorization: token $token" \
+                "$api/repos/$repo/releases/$release_id/assets/$old_id" > /dev/null
+            fi
 
-          curl -sS -f -X POST -H "Authorization: token $token" \
-            -F "attachment=@$asset_file" \
-            "$api/repos/$repo/releases/$release_id/assets?name=$asset_name" > /dev/null
-          echo "Uploaded $asset_name"
+            curl -sS -f -X POST -H "Authorization: token $token" \
+              -F "attachment=@$asset_file" \
+              "$api/repos/$repo/releases/$release_id/assets?name=$asset_name" > /dev/null
+            echo "Uploaded $asset_name"
+          done
 
   windows:
     runs-on: windows-latest

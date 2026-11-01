@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=timelapse4sai2
+Comment=Record PaintTool SAI 2 canvas timelapses
+Exec=timelapse4sai2-gui
+Icon=timelapse4sai2
+Categories=Graphics;
+Terminal=false

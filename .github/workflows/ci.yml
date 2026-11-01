@@ -7,10 +7,17 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-latest
+    container: ubuntu:22.04
     steps:
+      - name: Bootstrap Linux container
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git
       - uses: actions/checkout@v4
+      - run: bash scripts/linux-deps.sh
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --all-features --locked
+      - run: cargo build --release --all-features --locked
+      - run: bash scripts/package-linux.sh ci
+      - run: bash scripts/smoke-linux.sh
 
   windows:
     runs-on: windows-latest

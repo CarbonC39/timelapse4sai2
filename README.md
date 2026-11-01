@@ -47,6 +47,23 @@ Download the Windows x64 ZIP ending in `-gui.zip` from the releases page and
 extract it to a folder. Open `timelapse4sai2-gui.exe` for the desktop app.
 The separate `-cli.zip` contains `timelapse4sai2.exe` for terminal use.
 Linux releases also provide separate `-gui.tar.gz` and `-cli.tar.gz` archives.
+The Linux GUI is also available as an `.AppImage`:
+
+```sh
+chmod +x timelapse4sai2-*-linux-x64-gui.AppImage
+./timelapse4sai2-vVERSION-linux-x64-gui.AppImage
+```
+
+Linux release binaries are built in an Ubuntu 22.04 container and require
+x86-64 Linux with glibc 2.35 or newer. CI rejects newer mandatory glibc symbol
+requirements and smoke-tests the packaged binaries and extracted AppImage under
+Xvfb. The AppImage bundles X11/Wayland client libraries and fontconfig; the host
+still supplies glibc, graphics drivers, and an X11 or Wayland session. FFmpeg
+must be installed separately for video export. On systems without FUSE, launch
+by extracting with `./timelapse4sai2-vVERSION-linux-x64-gui.AppImage --appimage-extract`
+and then running `./squashfs-root/AppRun`.
+Alpine/musl and NixOS need their own compatibility environment or packaging.
+
 The Windows Visual C++ runtime is linked statically, so
 there is no separate runtime installer or DLL bundle to install. FFmpeg must
 still be available in `PATH` for video export.
@@ -127,7 +144,8 @@ cargo build --release --all-features --locked
 ```
 
 The CLI-only release build is `cargo build --release --locked`. CI runs the
-all-features test suite on Linux and Windows and a release build on Windows.
+all-features test suite and release builds on Linux and Windows. Linux CI also
+checks the glibc baseline, builds an AppImage, and smoke-tests the packages.
 The repository's `.cargo/config.toml` enables static CRT linkage for Windows
 x64 MSVC builds, including local builds and release workflows.
 
