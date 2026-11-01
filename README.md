@@ -135,17 +135,33 @@ The CLI-only release build is `cargo build --release --locked`.
 
 ### NixOS
 
+Build and run the packaged GUI and CLI from a checkout:
+
 ```sh
-nix-shell
-cargo run --release --features gui --bin timelapse4sai2-gui
+nix-build
+./result/bin/timelapse4sai2-gui
+./result/bin/timelapse4sai2 --help
 ```
 
-`shell.nix` provides Rust, FFmpeg, and the runtime Wayland/X11/OpenGL libraries.
-NixOS does not place these libraries in the global dynamic-loader path, so run
-the GUI from inside `nix-shell`; launching the binary from a normal shell fails
-with errors such as `NoWaylandLib`. A standalone packaged binary would need a Nix
-derivation or wrapper that supplies those runtime dependencies. The shell hook
-falls back to X11 when an inherited Wayland socket is unavailable.
+The package includes FFmpeg and the GUI runtime library paths. Run the GUI
+in your desktop session; no `nix-shell` is needed. Use a recent nixpkgs with
+Rust 1.89 or newer.
+
+For a CLI-only package:
+
+```sh
+nix-build --arg withGui false
+```
+
+To install through a NixOS configuration, point `callPackage` at your checkout:
+
+```nix
+environment.systemPackages = [
+  (pkgs.callPackage /path/to/timelapse4sai2/default.nix { })
+];
+```
+
+For development, use `nix-shell` and the Cargo commands above.
 
 ## Recording notes
 
