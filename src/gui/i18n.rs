@@ -318,7 +318,7 @@ fn english(key: Key) -> &'static str {
         AboutLicense => "License: GNU General Public License v3.0 only (GPL-3.0-only).",
         AboutFree => "Free and open source software.",
         AboutDistribution => {
-            "Official releases are free at the linked repository. Paid third-party copies are unofficial."
+            "This software is available for free at the linked repository. If you paid for it, you were scammed."
         }
         FinishingBeforeExit => "Finishing before exit…",
         Mp4 => "MP4",
@@ -447,7 +447,7 @@ fn simplified_chinese(key: Key) -> &'static str {
         AboutDescription => "录制并导出 PaintTool SAI 2 画布的延时视频。",
         AboutLicense => "许可证：GNU 通用公共许可证第 3 版（仅限 GPL-3.0-only）。",
         AboutFree => "自由且开源的软件。",
-        AboutDistribution => "官方版本可在链接的仓库免费获取。付费的第三方副本并非官方版本。",
+        AboutDistribution => "本软件可在链接的仓库免费获取。如果你付费获取了这个软件，那你就被骗了。",
         FinishingBeforeExit => "正在完成收尾工作并退出…",
         Mp4 => "MP4",
         Gib => "GiB",
@@ -575,7 +575,7 @@ fn japanese(key: Key) -> &'static str {
         AboutDescription => "PaintTool SAI 2 のキャンバスを録画し、タイムラプス動画として書き出します。",
         AboutLicense => "ライセンス：GNU General Public License v3.0 only（GPL-3.0-only）。",
         AboutFree => "自由でオープンソースなソフトウェアです。",
-        AboutDistribution => "公式リリースはリンク先のリポジトリで無料公開されています。第三者が販売するコピーは非公式です。",
+        AboutDistribution => "このソフトウェアはリンク先のリポジトリで無料で入手できます。お金を払って入手したのであれば、詐欺に遭っています。",
         FinishingBeforeExit => "終了前に処理を完了しています…",
         Mp4 => "MP4",
         Gib => "GiB",

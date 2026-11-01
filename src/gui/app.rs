@@ -1625,7 +1625,7 @@ mod tests {
     fn gui_exports_skip_provisional_captures_by_default() {
         let options = gui_options();
         assert!(options.skip_provisional);
-        assert_eq!(options.preview_end, 3.0);
+        assert_eq!(options.preview_end, 2.0);
         assert_eq!(options.hold_end, 3.0);
     }
     #[test]

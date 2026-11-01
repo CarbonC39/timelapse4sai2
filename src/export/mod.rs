@@ -29,7 +29,7 @@ pub const HELP: &str = "timelapse4sai2 export SESSION_DIR OUTPUT.mp4 [OPTIONS]
                               initial: center-crop to initial canvas. No scaling
                               during placement; unknown resize origin is centered
   --hold-end 3                Final artwork hold in seconds (0 disables)
-  --preview-end 3             Final artwork preview before drawing, in seconds
+  --preview-end 2             Final artwork preview before drawing, in seconds
   --skip-provisional          Only stable states (default includes provisional)
   --overwrite                 Replace existing output only after encoding succeeds
 Timestamps and idle time are ignored. Durations round to the nearest output frame.
@@ -109,7 +109,7 @@ impl Default for Options {
             size: Size::Auto,
             canvas_mode: CanvasMode::Max,
             hold_end: 3.0,
-            preview_end: 3.0,
+            preview_end: 2.0,
             skip_provisional: false,
             overwrite: false,
         }
